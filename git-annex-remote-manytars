@@ -1,0 +1,72 @@
+#!/usr/bin/env python
+
+import sys
+from pathlib import Path
+
+from annexremote import Master
+from annexremote import SpecialRemote
+from annexremote import RemoteError, ProtocolError
+
+
+def _mkdir(directory: Path):
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise RemoteError(f"Failed to write to {str(directory)!r}")
+
+
+class ManyTars(SpecialRemote):
+
+    def initremote(self):
+        self.directory = self.annex.getconfig('directory')
+        if not self.directory:
+            raise RemoteError("You need to set directory=")
+        self.directory = Path(directory)
+        _mkdir(self.directory)
+
+    def prepare(self):
+        self.directory = Path(self.annex.getconfig('directory'))
+        self.info = {'directory': self.directory}
+        if not self.directory.is_dir():
+            raise RemoteError(f"{str(self.directory)!r} not found.")
+        # check if there are any tars, mount them  # O(1)
+
+    def transfer_store(self, key, filename):
+        # "zip" filename to a temporary location
+        # select corresponding tar from first char of $key
+        # create tar file if it doesn't exist
+        # tar.append(zipped_file)
+        # umount mounted tar
+        # ratarmount file.tar rando_location so it rebuilds the index # O(n)
+        # raise RemoteError if the file couldn't be stored
+
+    def transfer_retrieve(self, key, filename):
+        # real_location = _make_path(_get_first_character(key))
+        # tar_path = real_location + ".tar"
+        # unmount real_location
+        # ratarmount tar_path real_location
+        # unzip key from real_location to filename
+        # raise RemoteError if the file couldn't be retrieved
+
+    def checkpresent(self, key):
+        # return True if the key is present in the remote
+        # return False if the key is not present
+        # raise RemoteError if the presence of the key couldn't be determined, eg. in case of connection error
+        
+    def remove(self, key):
+        # remove the key from the remote
+        # raise RemoteError if it couldn't be removed
+        # note that removing a not existing key isn't considered an error
+
+    def _get_first_character(key):
+        return 
+
+
+def main():
+    master = RemoteMaster()
+    remote = MyRemote(master)
+    master.LinkRemote(remote)
+    master.Listen()
+
+if __name__ == "__main__":
+    main()
