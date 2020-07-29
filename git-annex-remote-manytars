@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from subprocess import CompletedProcess, DEVNULL, Popen, run, STDOUT, PIPE
 from shlex import split
+from shutil import copy2
 from time import sleep
 from typing import List
 
@@ -16,12 +17,20 @@ from annexremote import SpecialRemote
 from annexremote import RemoteError, ProtocolError
 
 
-LOGFOLDER = Path("./logs/")
+LOGFOLDER = Path("~/projs/git-annex-remote-manytars/testrepo/logs").expanduser()
 LOGFOLDER.mkdir(exist_ok=True)
 
 
 class MountingError(RemoteError):
     pass
+
+
+def log_stuff(log_path: Path, lines: List[str]):
+    with open(LOGFOLDER / log_path, "a") as stdout_file:
+        stdout_file.write(f"{datetime.now()}\n")
+        stdout_file.write(f"{inspect.stack()[2].function}->")
+        stdout_file.write(f"{inspect.stack()[1].function}\n")
+        stdout_file.write("\n".join(lines))
 
 
 def _mkdir(directory: Path):
@@ -36,18 +45,13 @@ def ratarmount(
     mount_point: str,
     recreate_index: bool = False,
 ) -> CompletedProcess:
-    # raise TypeError(f"{type(mount_source)} {type(mount_point)}")
     args = f"ratarmount {mount_source} {mount_point}"
     # log_file = str(hash(args))
     args = split(args)
     if recreate_index:
         args.append("--recreate-index")
-    stdout_file = open(LOGFOLDER / mount_point, "a")
-    stdout_file.write(f"{datetime.now()}\n")
-    stdout_file.write(f"{args}\n{inspect.stack()[1].function}\n")
     proc = run(args, capture_output=True, text=True)
-    stdout_file.write(proc.stdout)
-    stdout_file.write(proc.stderr)
+    log_stuff(mount_point.stem, [proc.stdout, proc.stderr])
     # proc = Popen(args, stdin=DEVNULL, stdout=stdout_file, stderr=STDOUT, text=True)
     return proc
 
@@ -70,14 +74,17 @@ def filtermounted(tars: List[Path]) -> List[Path]:
 def umount(mount_point: Path):
     args = split(f"umount {mount_point}")
     proc = run(args, capture_output=True, text=True)
+    log_stuff(mount_point.name, [proc.stdout, proc.stderr])
     if proc.returncode != 0:
-        print(proc.stderr)
         raise MountingError(f"Could not unmount {mount_point}")
-    stdout_file = open(LOGFOLDER / mount_point, "a")
-    stdout_file.write(f"{datetime.now()}\n")
-    stdout_file.write(f"{args}\n{inspect.stack()[1].function}\n")
-    stdout_file.write(proc.stdout)
-    stdout_file.write(proc.stderr)
+
+
+def delete_from_tar(tar_path: str, file_to_remove: str):
+    args = split(f"tar -v --delete --file={tar_path} {file_to_remove}")
+    proc = run(args, capture_output=True, text=True)
+    log_stuff(tar_path.stem, [proc.stdout, proc.stderr])
+    if proc.returncode != 0:
+        raise RemoteError(f"Could not delete {file_to_remove.name!r} from {tar_path.name!r}.")
 
 
 class ManyTars(SpecialRemote):
@@ -85,16 +92,16 @@ class ManyTars(SpecialRemote):
     def initremote(self):
         self.address_length = 1
         self.directory = self.annex.getconfig('directory')
-        self.directory = "/home/gaius/projs/git-annex-remote-manytars/manga"
+        self.directory = "~/projs/git-annex-remote-manytars/manga"
         if not self.directory:
             raise RemoteError("You need to set directory=")
-        self.directory = Path(self.directory)
+        self.directory = Path(self.directory).expanduser()
         _mkdir(self.directory)
 
     def prepare(self):
         self.address_length = 2
         self.directory = Path(self.annex.getconfig('directory'))
-        self.directory = Path("/home/gaius/projs/git-annex-remote-manytars/manga")
+        self.directory = Path("~/projs/git-annex-remote-manytars/manga").expanduser()
         self.info = {'directory': self.directory}
         if not self.directory.is_dir():
             raise RemoteError(f"{str(self.directory)!r} not found.")
@@ -110,9 +117,8 @@ class ManyTars(SpecialRemote):
         """
         if self.checkpresent(key):
             return
-        stem = self._get_address(key)
-        tar_path = self.directory / f"{stem}.tar"
-        mount_point = self.directory / stem
+        mount_point = self._get_mount_point(key)
+        tar_path = self._get_tar_path(key)
         with tarfile.open(name=tar_path, mode="a:") as tareco:
             tareco.add(filename, arcname=key)
         if mount_point.is_dir():
@@ -125,25 +131,23 @@ class ManyTars(SpecialRemote):
 
     def transfer_retrieve(self, key: str, filename: str):
         if not self.checkpresent(key):
-            raise RemoteError
-        # tar_mountpoint_path = _make_path(_get_first_character(key))
-        # tar_path = tar_mountpoint_path + ".tar"
-        # unmount real_location
-        # ratarmount tar_path tar_mountpoint_path
-        # unzip key from tar_mountpoint_path to filename
+            raise RemoteError("Key not present in this remote.")
+        mount_point = self._get_mount_point(key)
+        tar_path = self._get_tar_path(key)
+        if not mount_point.is_dir():
+            ratarmount(tar_path, mount_point)
+        copy2(str(mount_point / key), filename)
 
     def checkpresent(self, key: str):
-        address = Path(self._get_address(key))
-        mount_point = self.directory / address
-        tar_path = mount_point.with_suffix(".tar")
+        mount_point = self._get_mount_point(key)
+        tar_path = self._get_tar_path(key)
         if tar_path.is_file():
             if not mount_point.is_dir():
                 ratarmount(tar_path, mount_point)
-            else:
-                file_path = mount_point / key
-                if file_path.is_file():
-                    # umount(mount_point)
-                    return True
+            file_path = mount_point / key
+            if file_path.is_file():
+                # umount(mount_point)
+                return True
         return False
 
     def remove(self, key: str):
@@ -152,6 +156,8 @@ class ManyTars(SpecialRemote):
         # note that removing a not existing key isn't considered an error
         if not self.checkpresent(key):
             return 
+        
+        raise RemoteError("Could not remove.")
 
     def _get_address(self, key: str) -> str:
         """
@@ -161,6 +167,12 @@ class ManyTars(SpecialRemote):
         address = parts[-1][:self.address_length]
         return address
 
+    def _get_mount_point(self, key: str) -> Path:
+        return self.directory / self._get_address(key)
+
+    def _get_tar_path(self, key: str) -> Path:
+        tar_path = self._get_mount_point(key)
+        return tar_path.with_suffix(".tar")
 
 def main():
     output = sys.stdout
