@@ -1,11 +1,27 @@
 #!/usr/bin/env python
 
+import inspect
+import os
+import tarfile
 import sys
+from datetime import datetime
 from pathlib import Path
+from subprocess import CompletedProcess, DEVNULL, Popen, run, STDOUT, PIPE
+from shlex import split
+from time import sleep
+from typing import List
 
 from annexremote import Master
 from annexremote import SpecialRemote
 from annexremote import RemoteError, ProtocolError
+
+
+LOGFOLDER = Path("./logs/")
+LOGFOLDER.mkdir(exist_ok=True)
+
+
+class MountingError(RemoteError):
+    pass
 
 
 def _mkdir(directory: Path):
@@ -15,56 +31,143 @@ def _mkdir(directory: Path):
         raise RemoteError(f"Failed to write to {str(directory)!r}")
 
 
+def ratarmount(
+    mount_source: str,
+    mount_point: str,
+    recreate_index: bool = False,
+) -> CompletedProcess:
+    # raise TypeError(f"{type(mount_source)} {type(mount_point)}")
+    args = f"ratarmount {mount_source} {mount_point}"
+    # log_file = str(hash(args))
+    args = split(args)
+    if recreate_index:
+        args.append("--recreate-index")
+    stdout_file = open(LOGFOLDER / mount_point, "a")
+    stdout_file.write(f"{datetime.now()}\n")
+    stdout_file.write(f"{args}\n{inspect.stack()[1].function}\n")
+    proc = run(args, capture_output=True, text=True)
+    stdout_file.write(proc.stdout)
+    stdout_file.write(proc.stderr)
+    # proc = Popen(args, stdin=DEVNULL, stdout=stdout_file, stderr=STDOUT, text=True)
+    return proc
+
+
+def mount_all_and_wait(tar_files: List[Path]):
+    processes = [
+        ratarmount(str(tar_file), str(tar_file.with_suffix("")))
+        for tar_file in tar_files
+    ]
+    if any(p.retcode != 0 for p in processes):
+        raise RemoteError("Could not ratarmount one of the .tar files.")
+    # while any(p.poll() is None for p in processes):
+    #     sleep(0.1)
+
+
+def filtermounted(tars: List[Path]) -> List[Path]:
+    return [tar_path for tar_path in tars if not tar_path.with_suffix("").is_dir()]
+
+
+def umount(mount_point: Path):
+    args = split(f"umount {mount_point}")
+    proc = run(args, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(proc.stderr)
+        raise MountingError(f"Could not unmount {mount_point}")
+    stdout_file = open(LOGFOLDER / mount_point, "a")
+    stdout_file.write(f"{datetime.now()}\n")
+    stdout_file.write(f"{args}\n{inspect.stack()[1].function}\n")
+    stdout_file.write(proc.stdout)
+    stdout_file.write(proc.stderr)
+
+
 class ManyTars(SpecialRemote):
 
     def initremote(self):
+        self.address_length = 1
         self.directory = self.annex.getconfig('directory')
+        self.directory = "/home/gaius/projs/git-annex-remote-manytars/manga"
         if not self.directory:
             raise RemoteError("You need to set directory=")
-        self.directory = Path(directory)
+        self.directory = Path(self.directory)
         _mkdir(self.directory)
 
     def prepare(self):
+        self.address_length = 2
         self.directory = Path(self.annex.getconfig('directory'))
+        self.directory = Path("/home/gaius/projs/git-annex-remote-manytars/manga")
         self.info = {'directory': self.directory}
         if not self.directory.is_dir():
             raise RemoteError(f"{str(self.directory)!r} not found.")
-        # check if there are any tars, mount them  # O(1)
+        # available_tars = self.directory.glob(r"*.tar")
+        # unmounted_tars = filtermounted(available_tars)
+        # mount_all_and_wait(unmounted_tars)  # O(1) because all indices are already updated 
 
-    def transfer_store(self, key, filename):
-        # "zip" filename to a temporary location
-        # select corresponding tar from first char of $key
-        # create tar file if it doesn't exist
-        # tar.append(zipped_file)
-        # umount mounted tar
-        # ratarmount file.tar rando_location so it rebuilds the index # O(n)
-        # raise RemoteError if the file couldn't be stored
+    def transfer_store(self, key: str, filename: str):
+        """
 
-    def transfer_retrieve(self, key, filename):
-        # real_location = _make_path(_get_first_character(key))
-        # tar_path = real_location + ".tar"
+        e.g.:
+        filename=".git/annex/objects/qW/pV/SHA256E-s148273064--5880ac1cd05eee90db251c027771b4c9f0a55b7c8b2813c95eff59eef465ebd3.wav/SHA256E-s148273064--5880ac1cd05eee90db251c027771b4c9f0a55b7c8b2813c95eff59eef465ebd3.wav"
+        """
+        if self.checkpresent(key):
+            return
+        stem = self._get_address(key)
+        tar_path = self.directory / f"{stem}.tar"
+        mount_point = self.directory / stem
+        with tarfile.open(name=tar_path, mode="a:") as tareco:
+            tareco.add(filename, arcname=key)
+        if mount_point.is_dir():
+            umount(mount_point)
+            ratarmount(tar_path, mount_point, recreate_index=True)  # O(n)
+        else:
+            ratarmount(tar_path, mount_point)  # O(n)
+        if not self.checkpresent(key):
+            raise RemoteError("Unknown error while storing the key.")
+
+    def transfer_retrieve(self, key: str, filename: str):
+        if not self.checkpresent(key):
+            raise RemoteError
+        # tar_mountpoint_path = _make_path(_get_first_character(key))
+        # tar_path = tar_mountpoint_path + ".tar"
         # unmount real_location
-        # ratarmount tar_path real_location
-        # unzip key from real_location to filename
-        # raise RemoteError if the file couldn't be retrieved
+        # ratarmount tar_path tar_mountpoint_path
+        # unzip key from tar_mountpoint_path to filename
 
-    def checkpresent(self, key):
-        # return True if the key is present in the remote
-        # return False if the key is not present
-        # raise RemoteError if the presence of the key couldn't be determined, eg. in case of connection error
-        
-    def remove(self, key):
+    def checkpresent(self, key: str):
+        address = Path(self._get_address(key))
+        mount_point = self.directory / address
+        tar_path = mount_point.with_suffix(".tar")
+        if tar_path.is_file():
+            if not mount_point.is_dir():
+                ratarmount(tar_path, mount_point)
+            else:
+                file_path = mount_point / key
+                if file_path.is_file():
+                    # umount(mount_point)
+                    return True
+        return False
+
+    def remove(self, key: str):
         # remove the key from the remote
         # raise RemoteError if it couldn't be removed
         # note that removing a not existing key isn't considered an error
+        if not self.checkpresent(key):
+            return 
 
-    def _get_first_character(key):
-        return 
+    def _get_address(self, key: str) -> str:
+        """
+        key="SHA256E-s148273064--5880ac1cd05eee90db251c027771b4c9f0a55b7c8b2813c95eff59eef465ebd3.wav"
+        """
+        parts = key.split("-")
+        address = parts[-1][:self.address_length]
+        return address
 
 
 def main():
-    master = RemoteMaster()
-    remote = MyRemote(master)
+    output = sys.stdout
+    sys.stdout = sys.stderr
+
+    master = Master(output)
+    remote = ManyTars(master)
     master.LinkRemote(remote)
     master.Listen()
 
