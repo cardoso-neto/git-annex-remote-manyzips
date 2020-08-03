@@ -25,7 +25,7 @@ class MountingError(RemoteError):
     pass
 
 
-def log_stuff(log_path: Path, lines: List[str]):
+def log_stuff(log_path: str, lines: List[str]):
     with open(LOGFOLDER / log_path, "a") as stdout_file:
         stdout_file.write(f"{datetime.now()}\n")
         stdout_file.write(f"{inspect.stack()[2].function}->")
@@ -41,8 +41,8 @@ def _mkdir(directory: Path):
 
 
 def ratarmount(
-    mount_source: str,
-    mount_point: str,
+    mount_source: Path,
+    mount_point: Path,
     recreate_index: bool = False,
 ) -> CompletedProcess:
     args = f"ratarmount {mount_source} {mount_point}"
@@ -58,7 +58,7 @@ def ratarmount(
 
 def mount_all_and_wait(tar_files: List[Path]):
     processes = [
-        ratarmount(str(tar_file), str(tar_file.with_suffix("")))
+        ratarmount(tar_file, tar_file.with_suffix(""))
         for tar_file in tar_files
     ]
     if any(p.retcode != 0 for p in processes):
@@ -72,19 +72,24 @@ def filtermounted(tars: List[Path]) -> List[Path]:
 
 
 def umount(mount_point: Path):
-    args = split(f"umount {mount_point}")
+    """
+    "-l" option avoids that pesky "Could not unmount; target is busy" error.
+    I found out about it here: https://stackoverflow.com/a/19969471
+    I'm not sure yet if it actually works though, or if it'll just give out harder-to-deal errors.
+    """
+    args = split(f"umount -l {mount_point}")
     proc = run(args, capture_output=True, text=True)
     log_stuff(mount_point.name, [proc.stdout, proc.stderr])
     if proc.returncode != 0:
         raise MountingError(f"Could not unmount {mount_point}")
 
 
-def delete_from_tar(tar_path: str, file_to_remove: str):
+def delete_from_tar(tar_path: Path, file_to_remove: str):
     args = split(f"tar -v --delete --file={tar_path} {file_to_remove}")
     proc = run(args, capture_output=True, text=True)
     log_stuff(tar_path.stem, [proc.stdout, proc.stderr])
     if proc.returncode != 0:
-        raise RemoteError(f"Could not delete {file_to_remove.name!r} from {tar_path.name!r}.")
+        raise RemoteError(f"Could not delete {file_to_remove!r} from {tar_path.name!r}.")
 
 
 class ManyTars(SpecialRemote):
@@ -126,6 +131,7 @@ class ManyTars(SpecialRemote):
             ratarmount(tar_path, mount_point, recreate_index=True)  # O(n)
         else:
             ratarmount(tar_path, mount_point)  # O(n)
+            # umount(mount_point)
         if not self.checkpresent(key):
             raise RemoteError("Unknown error while storing the key.")
 
@@ -151,13 +157,19 @@ class ManyTars(SpecialRemote):
         return False
 
     def remove(self, key: str):
-        # remove the key from the remote
-        # raise RemoteError if it couldn't be removed
-        # note that removing a not existing key isn't considered an error
         if not self.checkpresent(key):
             return 
-        
-        raise RemoteError("Could not remove.")
+        tar_path = self._get_tar_path(key)
+        mount_point = self._get_mount_point(key)
+        delete_from_tar(tar_path, key)  # O(n)
+        if mount_point.is_dir():
+            umount(mount_point)
+            ratarmount(tar_path, mount_point, recreate_index=True)  # O(n)
+        else:
+            ratarmount(tar_path, mount_point)  # O(n)
+            # umount(mount_point)
+        if self.checkpresent(key):
+            raise RemoteError("Could not remove.")
 
     def _get_address(self, key: str) -> str:
         """
@@ -174,6 +186,7 @@ class ManyTars(SpecialRemote):
         tar_path = self._get_mount_point(key)
         return tar_path.with_suffix(".tar")
 
+
 def main():
     output = sys.stdout
     sys.stdout = sys.stderr
@@ -182,6 +195,7 @@ def main():
     remote = ManyTars(master)
     master.LinkRemote(remote)
     master.Listen()
+
 
 if __name__ == "__main__":
     main()
