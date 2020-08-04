@@ -15,16 +15,16 @@ from annexremote import Master, ProtocolError, RemoteError, SpecialRemote
 from overrides import overrides
 
 
-LOGFOLDER = Path("~/projs/git-annex-remote-manytars/testrepo/logs").expanduser()
-LOGFOLDER.mkdir(exist_ok=True)
+LOGFOLDER = Path("./logs/")
 
 
 class MountingError(RemoteError):
     pass
 
 
-def log_stuff(log_path: str, lines: List[str]):
-    with open(LOGFOLDER / log_path, "a") as stdout_file:
+def log_stuff(log_path: Path, lines: List[str]):
+    log_path.parent.mkdir(exist_ok=True)
+    with open(log_path, "a") as stdout_file:
         stdout_file.write(f"{datetime.now()}\n")
         stdout_file.write(f"{inspect.stack()[2].function}->")
         stdout_file.write(f"{inspect.stack()[1].function}\n")
@@ -48,7 +48,7 @@ def ratarmount(
     if recreate_index:
         args.append("--recreate-index")
     proc = run(args, capture_output=True, text=True)
-    log_stuff(mount_point.stem, [proc.stdout, proc.stderr])
+    log_stuff(mount_point.parent / LOGFOLDER / f"{mount_point.stem}.log", [proc.stdout, proc.stderr])
     return proc
 
 
@@ -61,7 +61,7 @@ def mount_all_and_wait(tar_files: List[Path]):
         failed_procs = [processes[i] for i, p in enumerate(processes) if p.returncode != 0]
         for p in failed_procs:
             print(p.args, p.stderr, file=sys.stderr, sep="\n", end="\n\n")
-        raise RemoteError("Could not ratarmount some of the .tar files.")
+        raise MountingError("Could not ratarmount some of the .tar files.")
 
 
 def filtermounted(tars: List[Path]) -> List[Path]:
@@ -76,7 +76,7 @@ def umount(mount_point: Path):
     """
     args = split(f"umount -l {mount_point}")
     proc = run(args, capture_output=True, text=True)
-    log_stuff(mount_point.name, [proc.stdout, proc.stderr])
+    log_stuff(mount_point.parent / LOGFOLDER / f"{mount_point.name}.log", [proc.stdout, proc.stderr])
     if proc.returncode != 0:
         raise MountingError(f"Could not unmount {mount_point}")
 
@@ -84,7 +84,7 @@ def umount(mount_point: Path):
 def delete_from_tar(tar_path: Path, file_to_remove: str):
     args = split(f"tar -v --delete --file={tar_path} {file_to_remove}")
     proc = run(args, capture_output=True, text=True)
-    log_stuff(tar_path.stem, [proc.stdout, proc.stderr])
+    log_stuff(tar_path.parent / LOGFOLDER / f"{tar_path.stem}.log", [proc.stdout, proc.stderr])
     if proc.returncode != 0:
         raise RemoteError(f"Could not delete {file_to_remove!r} from {tar_path.name!r}.")
 
@@ -196,7 +196,7 @@ class ManyTars(SpecialRemote):
     def _get_tar_path(self, key: str) -> Path:
         tar_path = self._get_mount_point(key)
         return tar_path.with_suffix(".tar")
-
+ 
     @overrides
     def getavailability(self) -> str:
         return "local"
