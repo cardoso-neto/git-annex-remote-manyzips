@@ -6,15 +6,13 @@ import tarfile
 import sys
 from datetime import datetime
 from pathlib import Path
-from subprocess import CompletedProcess, DEVNULL, Popen, run, STDOUT, PIPE
+from subprocess import CompletedProcess, run
 from shlex import split
 from shutil import copy2
-from time import sleep
 from typing import List
 
-from annexremote import Master
-from annexremote import SpecialRemote
-from annexremote import RemoteError, ProtocolError
+from annexremote import Master, ProtocolError, RemoteError, SpecialRemote
+from overrides import overrides
 
 
 LOGFOLDER = Path("~/projs/git-annex-remote-manytars/testrepo/logs").expanduser()
@@ -46,13 +44,11 @@ def ratarmount(
     recreate_index: bool = False,
 ) -> CompletedProcess:
     args = f"ratarmount {mount_source} {mount_point}"
-    # log_file = str(hash(args))
     args = split(args)
     if recreate_index:
         args.append("--recreate-index")
     proc = run(args, capture_output=True, text=True)
     log_stuff(mount_point.stem, [proc.stdout, proc.stderr])
-    # proc = Popen(args, stdin=DEVNULL, stdout=stdout_file, stderr=STDOUT, text=True)
     return proc
 
 
@@ -61,10 +57,11 @@ def mount_all_and_wait(tar_files: List[Path]):
         ratarmount(tar_file, tar_file.with_suffix(""))
         for tar_file in tar_files
     ]
-    if any(p.retcode != 0 for p in processes):
-        raise RemoteError("Could not ratarmount one of the .tar files.")
-    # while any(p.poll() is None for p in processes):
-    #     sleep(0.1)
+    if any(p.returncode != 0 for p in processes):
+        failed_procs = [processes[i] for i, p in enumerate(processes) if p.returncode != 0]
+        for p in failed_procs:
+            print(p.args, p.stderr, file=sys.stderr, sep="\n", end="\n\n")
+        raise RemoteError("Could not ratarmount some of the .tar files.")
 
 
 def filtermounted(tars: List[Path]) -> List[Path]:
@@ -94,20 +91,33 @@ def delete_from_tar(tar_path: Path, file_to_remove: str):
 
 class ManyTars(SpecialRemote):
 
-    def initremote(self):
-        self.address_length = 1
-        self.directory = self.annex.getconfig('directory')
-        self.directory = "~/projs/git-annex-remote-manytars/manga"
-        if not self.directory:
+    def __init__(self, annex):
+        super().__init__(annex)
+        self.info = {}
+        self.configs = {
+            "address_length": "1 for 16 .tars, 2 for 256, and 3 for 4096.",
+            "directory": "Folder to store data.",
+        }
+
+    def _get_params(self):
+        address_length = self.annex.getconfig("address_length")
+        address_length = int(address_length) if address_length != "" else 1
+        if not 0 < address_length < 3:
+            raise RemoteError("address_length value should be greater than zero and smaller than 3.")
+        directory = self.annex.getconfig("directory")
+        if not directory:
             raise RemoteError("You need to set directory=")
-        self.directory = Path(self.directory).expanduser()
+        directory = Path(directory).expanduser()
+        return address_length, directory
+
+    def initremote(self):
+        self.address_length, self.directory = self._get_params()
+        self.info = {"directory": self.directory, "address_length": self.address_length}
         _mkdir(self.directory)
 
     def prepare(self):
-        self.address_length = 2
-        self.directory = Path(self.annex.getconfig('directory'))
-        self.directory = Path("~/projs/git-annex-remote-manytars/manga").expanduser()
-        self.info = {'directory': self.directory}
+        self.address_length, self.directory = self._get_params()
+        self.info = {"directory": self.directory, "address_length": self.address_length}
         if not self.directory.is_dir():
             raise RemoteError(f"{str(self.directory)!r} not found.")
         # available_tars = self.directory.glob(r"*.tar")
@@ -141,10 +151,11 @@ class ManyTars(SpecialRemote):
         mount_point = self._get_mount_point(key)
         tar_path = self._get_tar_path(key)
         if not mount_point.is_dir():
-            ratarmount(tar_path, mount_point)
+            ratarmount(tar_path, mount_point)  # O(1)
+        # TODO: copy to a tempfile then rename
         copy2(str(mount_point / key), filename)
 
-    def checkpresent(self, key: str):
+    def checkpresent(self, key: str) -> bool:
         mount_point = self._get_mount_point(key)
         tar_path = self._get_tar_path(key)
         if tar_path.is_file():
@@ -152,7 +163,7 @@ class ManyTars(SpecialRemote):
                 ratarmount(tar_path, mount_point)
             file_path = mount_point / key
             if file_path.is_file():
-                # umount(mount_point)
+                # umount(mount_point) #
                 return True
         return False
 
@@ -167,7 +178,7 @@ class ManyTars(SpecialRemote):
             ratarmount(tar_path, mount_point, recreate_index=True)  # O(n)
         else:
             ratarmount(tar_path, mount_point)  # O(n)
-            # umount(mount_point)
+            umount(mount_point) #
         if self.checkpresent(key):
             raise RemoteError("Could not remove.")
 
@@ -185,6 +196,10 @@ class ManyTars(SpecialRemote):
     def _get_tar_path(self, key: str) -> Path:
         tar_path = self._get_mount_point(key)
         return tar_path.with_suffix(".tar")
+
+    @overrides
+    def getavailability(self) -> str:
+        return "local"
 
 
 def main():
