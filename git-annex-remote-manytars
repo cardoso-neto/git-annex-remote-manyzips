@@ -39,26 +39,28 @@ def _mkdir(directory: Path):
 
 
 def ratarmount(
-    mount_source: Path,
-    mount_point: Path,
-    recreate_index: bool = False,
+    mount_source: Path, mount_point: Path, recreate_index: bool = False,
 ) -> CompletedProcess:
     args = f"ratarmount {mount_source} {mount_point}"
     args = split(args)
     if recreate_index:
         args.append("--recreate-index")
     proc = run(args, capture_output=True, text=True)
-    log_stuff(mount_point.parent / LOGFOLDER / f"{mount_point.stem}.log", [proc.stdout, proc.stderr])
+    log_stuff(
+        mount_point.parent / LOGFOLDER / f"{mount_point.stem}.log",
+        [proc.stdout, proc.stderr],
+    )
     return proc
 
 
 def mount_all_and_wait(tar_files: List[Path]):
     processes = [
-        ratarmount(tar_file, tar_file.with_suffix(""))
-        for tar_file in tar_files
+        ratarmount(tar_file, tar_file.with_suffix("")) for tar_file in tar_files
     ]
     if any(p.returncode != 0 for p in processes):
-        failed_procs = [processes[i] for i, p in enumerate(processes) if p.returncode != 0]
+        failed_procs = [
+            processes[i] for i, p in enumerate(processes) if p.returncode != 0
+        ]
         for p in failed_procs:
             print(p.args, p.stderr, file=sys.stderr, sep="\n", end="\n\n")
         raise MountingError("Could not ratarmount some of the .tar files.")
@@ -76,7 +78,10 @@ def umount(mount_point: Path):
     """
     args = split(f"umount -l {mount_point}")
     proc = run(args, capture_output=True, text=True)
-    log_stuff(mount_point.parent / LOGFOLDER / f"{mount_point.name}.log", [proc.stdout, proc.stderr])
+    log_stuff(
+        mount_point.parent / LOGFOLDER / f"{mount_point.name}.log",
+        [proc.stdout, proc.stderr],
+    )
     if proc.returncode != 0:
         raise MountingError(f"Could not unmount {mount_point}")
 
@@ -84,13 +89,16 @@ def umount(mount_point: Path):
 def delete_from_tar(tar_path: Path, file_to_remove: str):
     args = split(f"tar -v --delete --file={tar_path} {file_to_remove}")
     proc = run(args, capture_output=True, text=True)
-    log_stuff(tar_path.parent / LOGFOLDER / f"{tar_path.stem}.log", [proc.stdout, proc.stderr])
+    log_stuff(
+        tar_path.parent / LOGFOLDER / f"{tar_path.stem}.log", [proc.stdout, proc.stderr]
+    )
     if proc.returncode != 0:
-        raise RemoteError(f"Could not delete {file_to_remove!r} from {tar_path.name!r}.")
+        raise RemoteError(
+            f"Could not delete {file_to_remove!r} from {tar_path.name!r}."
+        )
 
 
 class ManyTars(SpecialRemote):
-
     def __init__(self, annex):
         super().__init__(annex)
         self.info = {}
@@ -103,7 +111,8 @@ class ManyTars(SpecialRemote):
         address_length = self.annex.getconfig("address_length")
         address_length = int(address_length) if address_length != "" else 1
         if not 0 < address_length < 3:
-            raise RemoteError("address_length value should be greater than zero and smaller than 3.")
+            msg = "address_length value should be greater than zero and smaller than 3."
+            raise RemoteError(msg)
         directory = self.annex.getconfig("directory")
         if not directory:
             raise RemoteError("You need to set directory=")
@@ -122,7 +131,7 @@ class ManyTars(SpecialRemote):
             raise RemoteError(f"{str(self.directory)!r} not found.")
         # available_tars = self.directory.glob(r"*.tar")
         # unmounted_tars = filtermounted(available_tars)
-        # mount_all_and_wait(unmounted_tars)  # O(1) because all indices are already updated 
+        # mount_all_and_wait(unmounted_tars)  # O(1) because all indices are already updated
 
     def transfer_store(self, key: str, filename: str):
         """
@@ -169,7 +178,7 @@ class ManyTars(SpecialRemote):
 
     def remove(self, key: str):
         if not self.checkpresent(key):
-            return 
+            return
         tar_path = self._get_tar_path(key)
         mount_point = self._get_mount_point(key)
         delete_from_tar(tar_path, key)  # O(n)
@@ -178,7 +187,7 @@ class ManyTars(SpecialRemote):
             ratarmount(tar_path, mount_point, recreate_index=True)  # O(n)
         else:
             ratarmount(tar_path, mount_point)  # O(n)
-            umount(mount_point) #
+            umount(mount_point)  #
         if self.checkpresent(key):
             raise RemoteError("Could not remove.")
 
@@ -187,7 +196,7 @@ class ManyTars(SpecialRemote):
         key="SHA256E-s148273064--5880ac1cd05eee90db251c027771b4c9f0a55b7c8b2813c95eff59eef465ebd3.wav"
         """
         parts = key.split("-")
-        address = parts[-1][:self.address_length]
+        address = parts[-1][: self.address_length]
         return address
 
     def _get_mount_point(self, key: str) -> Path:
@@ -196,7 +205,7 @@ class ManyTars(SpecialRemote):
     def _get_tar_path(self, key: str) -> Path:
         tar_path = self._get_mount_point(key)
         return tar_path.with_suffix(".tar")
- 
+
     @overrides
     def getavailability(self) -> str:
         return "local"
