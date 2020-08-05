@@ -2,14 +2,15 @@
 
 import inspect
 import os
-import tarfile
+import zipfile
 import sys
 from datetime import datetime
 from pathlib import Path
 from subprocess import CompletedProcess, run
 from shlex import split
-from shutil import copy2
-from typing import List
+from typing import BinaryIO, List
+from zipfile import ZIP_DEFLATED, ZIP_LZMA, ZIP_STORED
+from zipfile import ZipFile, ZipInfo
 
 from annexremote import Master, ProtocolError, RemoteError, SpecialRemote
 from overrides import overrides
@@ -18,7 +19,7 @@ from overrides import overrides
 LOGFOLDER = Path("./logs/")
 
 
-class MountingError(RemoteError):
+class UnsupportedCompression(RemoteError):
     pass
 
 
@@ -38,101 +39,95 @@ def _mkdir(directory: Path):
         raise RemoteError(f"Failed to write to {str(directory)!r}")
 
 
-def ratarmount(
-    mount_source: Path, mount_point: Path, recreate_index: bool = False,
-) -> CompletedProcess:
-    args = f"ratarmount {mount_source} {mount_point}"
-    args = split(args)
-    if recreate_index:
-        args.append("--recreate-index")
-    proc = run(args, capture_output=True, text=True)
-    log_stuff(
-        mount_point.parent / LOGFOLDER / f"{mount_point.stem}.log",
-        [proc.stdout, proc.stderr],
-    )
-    return proc
-
-
-def mount_all_and_wait(tar_files: List[Path]):
-    processes = [
-        ratarmount(tar_file, tar_file.with_suffix("")) for tar_file in tar_files
-    ]
-    if any(p.returncode != 0 for p in processes):
-        failed_procs = [
-            processes[i] for i, p in enumerate(processes) if p.returncode != 0
-        ]
-        for p in failed_procs:
-            print(p.args, p.stderr, file=sys.stderr, sep="\n", end="\n\n")
-        raise MountingError("Could not ratarmount some of the .tar files.")
-
-
-def filtermounted(tars: List[Path]) -> List[Path]:
-    return [tar_path for tar_path in tars if not tar_path.with_suffix("").is_dir()]
-
-
-def umount(mount_point: Path):
+def copyfileobj(
+    fsrc: BinaryIO,
+    fdst: BinaryIO,
+    length: int = 128 * 1024,
+    callback: Optional[Callable[[int], None]] = None,
+):
     """
-    "-l" option avoids that pesky "Could not unmount; target is busy" error.
-    I found out about it here: https://stackoverflow.com/a/19969471
-    I'm not sure yet if it actually works though, or if it'll just give out harder-to-deal errors.
+    Copy data while passing the progress through a callback every length bytes.
+
+    shutil.copyfileobj reimplementation with: 
+    - a bigger default buffer length; 
+    - and a callback to track copying progress.
+    Copy data from file-like obj fsrc to file-like obj fdst.
     """
-    args = split(f"umount -l {mount_point}")
-    proc = run(args, capture_output=True, text=True)
-    log_stuff(
-        mount_point.parent / LOGFOLDER / f"{mount_point.name}.log",
-        [proc.stdout, proc.stderr],
-    )
-    if proc.returncode != 0:
-        raise MountingError(f"Could not unmount {mount_point}")
+    if callback is None:
+        callback = lambda x: None
+    # Localize variable access to minimize overhead.
+    fsrc_read = fsrc.read
+    fdst_write = fdst.write
+    streamed_bytes = 0
+    while buf := fsrc_read(length):
+        streamed_bytes += len(buf)
+        callback(streamed_bytes)
+        fdst_write(buf)
 
 
-def delete_from_tar(tar_path: Path, file_to_remove: str):
-    args = split(f"tar -v --delete --file={tar_path} {file_to_remove}")
-    proc = run(args, capture_output=True, text=True)
-    log_stuff(
-        tar_path.parent / LOGFOLDER / f"{tar_path.stem}.log", [proc.stdout, proc.stderr]
-    )
-    if proc.returncode != 0:
-        raise RemoteError(
-            f"Could not delete {file_to_remove!r} from {tar_path.name!r}."
-        )
+class ManyZips(SpecialRemote):
 
-
-class ManyTars(SpecialRemote):
-    def __init__(self, annex):
+    def __init__(self, annex: Master):
         super().__init__(annex)
-        self.info = {}
         self.configs = {
-            "address_length": "1 for 16 .tars, 2 for 256, and 3 for 4096.",
+            "address_length": "1 for 16 .zips, 2 for 256, and 3 for 4096.",
             "directory": "Folder to store data.",
+            "compression": "Either 'store' for no compression or 'lzma' for .xz compression."
         }
 
-    def _get_params(self):
+    @property
+    def address_length(self) -> int:
         address_length = self.annex.getconfig("address_length")
         address_length = int(address_length) if address_length != "" else 1
         if not 0 < address_length < 3:
-            msg = "address_length value should be greater than zero and smaller than 3."
-            raise RemoteError(msg)
+            raise RemoteError("address_length value should be greater than zero and smaller than 3.")
+        return address_length
+
+    @property
+    def compression(self) -> int:
+        compression = self.annex.getconfig("compression")
+        if not compression
+            self.annex.setconfig("compression", "store")
+        elif compression == "store"
+            compression = ZIP_STORED
+        elif compression == "lzma":
+            compression = ZIP_LZMA
+        elif compression == "deflated":
+            compression = ZIP_DEFLATED
+        else:
+            msg = f"Compression type {compression!r} is not available.\n"
+            msg += "Try using 'store', 'lzma', or 'deflated'."
+            raise UnsupportedCompression(msg)
+        return compression
+
+    @property
+    def directory(self) -> Path:
         directory = self.annex.getconfig("directory")
         if not directory:
             raise RemoteError("You need to set directory=")
-        directory = Path(directory).expanduser()
-        return address_length, directory
+        directory = Path(directory).resolve()
+        return directory
 
+    @overrides
     def initremote(self):
-        self.address_length, self.directory = self._get_params()
-        self.info = {"directory": self.directory, "address_length": self.address_length}
+        self.info = {
+            "address_length": self.address_length,
+            "compression" self.compression,
+            "directory": self.directory,
+        }
         _mkdir(self.directory)
 
+    @overrides
     def prepare(self):
-        self.address_length, self.directory = self._get_params()
-        self.info = {"directory": self.directory, "address_length": self.address_length}
+        self.info = {
+            "address_length": self.address_length,
+            "compression" self.compression,
+            "directory": self.directory,
+        }
         if not self.directory.is_dir():
             raise RemoteError(f"{str(self.directory)!r} not found.")
-        # available_tars = self.directory.glob(r"*.tar")
-        # unmounted_tars = filtermounted(available_tars)
-        # mount_all_and_wait(unmounted_tars)  # O(1) because all indices are already updated
 
+    @overrides
     def transfer_store(self, key: str, filename: str):
         """
 
@@ -141,29 +136,28 @@ class ManyTars(SpecialRemote):
         """
         if self.checkpresent(key):
             return
-        mount_point = self._get_mount_point(key)
-        tar_path = self._get_tar_path(key)
-        with tarfile.open(name=tar_path, mode="a:") as tareco:
-            tareco.add(filename, arcname=key)
-        if mount_point.is_dir():
-            umount(mount_point)
-            ratarmount(tar_path, mount_point, recreate_index=True)  # O(n)
-        else:
-            ratarmount(tar_path, mount_point)  # O(n)
-            # umount(mount_point)
+        zip_path = self._get_zip_path(key)
+        with ZipFile(zip_path, 'w', compression=self.compression, allowZip64=True) as myzip:
+            zinfo = ZipInfo.from_file(
+                filename, arcname=key, strict_timestamps=myzip._strict_timestamps
+            )
+            zinfo.compress_type = myzip.compression
+            with open(filename, "rb") as src, myzip.open(zinfo, 'w') as dest:
+                copyfileobj(src, dest, callback=self.annex.progress)
         if not self.checkpresent(key):
             raise RemoteError("Unknown error while storing the key.")
 
+    @overrides
     def transfer_retrieve(self, key: str, filename: str):
         if not self.checkpresent(key):
             raise RemoteError("Key not present in this remote.")
         mount_point = self._get_mount_point(key)
         tar_path = self._get_tar_path(key)
-        if not mount_point.is_dir():
-            ratarmount(tar_path, mount_point)  # O(1)
+
         # TODO: copy to a tempfile then rename
         copy2(str(mount_point / key), filename)
 
+    @overrides
     def checkpresent(self, key: str) -> bool:
         mount_point = self._get_mount_point(key)
         tar_path = self._get_tar_path(key)
@@ -176,36 +170,28 @@ class ManyTars(SpecialRemote):
                 return True
         return False
 
+    @overrides
     def remove(self, key: str):
         if not self.checkpresent(key):
-            return
+            return 
         tar_path = self._get_tar_path(key)
         mount_point = self._get_mount_point(key)
         delete_from_tar(tar_path, key)  # O(n)
-        if mount_point.is_dir():
-            umount(mount_point)
-            ratarmount(tar_path, mount_point, recreate_index=True)  # O(n)
-        else:
-            ratarmount(tar_path, mount_point)  # O(n)
-            umount(mount_point)  #
         if self.checkpresent(key):
             raise RemoteError("Could not remove.")
 
     def _get_address(self, key: str) -> str:
-        """
-        key="SHA256E-s148273064--5880ac1cd05eee90db251c027771b4c9f0a55b7c8b2813c95eff59eef465ebd3.wav"
-        """
+        # "SHA256E-s148273064--5880ac1cd05eee9...eef465ebd3.wav"
         parts = key.split("-")
-        address = parts[-1][: self.address_length]
+        # ["SHA256E", "s148273064", "5880ac1cd05eee9...eef465ebd3.wav"
+        address = parts[-1][:self.address_length]
+        # "588"
         return address
 
-    def _get_mount_point(self, key: str) -> Path:
-        return self.directory / self._get_address(key)
-
-    def _get_tar_path(self, key: str) -> Path:
-        tar_path = self._get_mount_point(key)
-        return tar_path.with_suffix(".tar")
-
+    def _get_zip_path(self, key: str) -> Path:
+        zip_path_and_stem = self.directory / self._get_address(key)
+        return zip_path_and_stem.with_suffix(".zip")
+ 
     @overrides
     def getavailability(self) -> str:
         return "local"
@@ -216,7 +202,7 @@ def main():
     sys.stdout = sys.stderr
 
     master = Master(output)
-    remote = ManyTars(master)
+    remote = ManyZips(master)
     master.LinkRemote(remote)
     master.Listen()
 
