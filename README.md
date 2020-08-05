@@ -1,8 +1,8 @@
 # git-annex-remote-manytars
-Cold storage external remote that can be easily and quickly copied.
+External remote that can be easily and quickly copied.
 
-This is very similar to a directory special remote, but files are stored inside `.tar` archives to allow for faster copies to other drives and things like that.
-
+This is very similar to a directory special remote, but files are stored inside `.zip` archives (compressed or not) to allow for faster copies to other drives by minimizing random access look-ups on disks.
+<!--
 ## Options overview
 
 - `directory` - folder path to store the data.
@@ -39,3 +39,4 @@ No problems will arise, but to avoid data loss you should not ever remove files 
 This parameter ontrols how many characters of the beginning of a file's hex hash digest will be used for the `.tar` file path.
 e.g.: if `address_length = 3` and `SHA256E-s50621986--ddd1a997afaf60c981fbfb1a1f3a600ff7bad7fccece9f2508fb695b8c2f153d` as the file to be stored, the `.tar` path will be `ddd.tar` and all files stored here would go into one of 4096 buckets.
 You don't want to let your `.tar`s get too big, otherwise insertions will start taking longer and longer, because each insertion requires me to rebuild the whole index for that archive, so it's `O(n/number_of_buckets)` operation.
+-->
