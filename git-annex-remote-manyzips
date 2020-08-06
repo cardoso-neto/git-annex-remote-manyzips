@@ -8,9 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from subprocess import CompletedProcess, run
 from shlex import split
-from typing import BinaryIO, List
+from typing import BinaryIO, Callable, List, Optional
 from zipfile import ZIP_DEFLATED, ZIP_LZMA, ZIP_STORED
-from zipfile import ZipFile, ZipInfo
+from zipfile import Path as ZipPath, ZipFile, ZipInfo
 
 from annexremote import Master, ProtocolError, RemoteError, SpecialRemote
 from overrides import overrides
@@ -42,8 +42,8 @@ def _mkdir(directory: Path):
 def copyfileobj(
     fsrc: BinaryIO,
     fdst: BinaryIO,
-    length: int = 128 * 1024,
-    callback: Optional[Callable[[int], None]] = None,
+    length: int = 1024 * 1024,
+    callback: Callable[[int], None] = lambda x: None,
 ):
     """
     Copy data while passing the progress through a callback every length bytes.
@@ -53,16 +53,14 @@ def copyfileobj(
     - and a callback to track copying progress.
     Copy data from file-like obj fsrc to file-like obj fdst.
     """
-    if callback is None:
-        callback = lambda x: None
     # Localize variable access to minimize overhead.
     fsrc_read = fsrc.read
     fdst_write = fdst.write
     streamed_bytes = 0
     while buf := fsrc_read(length):
         streamed_bytes += len(buf)
-        callback(streamed_bytes)
         fdst_write(buf)
+        callback(streamed_bytes)
 
 
 class ManyZips(SpecialRemote):
@@ -86,9 +84,9 @@ class ManyZips(SpecialRemote):
     @property
     def compression(self) -> int:
         compression = self.annex.getconfig("compression")
-        if not compression
+        if not compression:
             self.annex.setconfig("compression", "store")
-        elif compression == "store"
+        elif compression == "store":
             compression = ZIP_STORED
         elif compression == "lzma":
             compression = ZIP_LZMA
@@ -112,7 +110,7 @@ class ManyZips(SpecialRemote):
     def initremote(self):
         self.info = {
             "address_length": self.address_length,
-            "compression" self.compression,
+            "compression": self.compression,
             "directory": self.directory,
         }
         _mkdir(self.directory)
@@ -121,7 +119,7 @@ class ManyZips(SpecialRemote):
     def prepare(self):
         self.info = {
             "address_length": self.address_length,
-            "compression" self.compression,
+            "compression": self.compression,
             "directory": self.directory,
         }
         if not self.directory.is_dir():
@@ -159,14 +157,9 @@ class ManyZips(SpecialRemote):
 
     @overrides
     def checkpresent(self, key: str) -> bool:
-        mount_point = self._get_mount_point(key)
-        tar_path = self._get_tar_path(key)
-        if tar_path.is_file():
-            if not mount_point.is_dir():
-                ratarmount(tar_path, mount_point)
-            file_path = mount_point / key
-            if file_path.is_file():
-                # umount(mount_point) #
+        zip_path = self._get_zip_path(key)
+        if zip_path.is_file():
+            if ZipPath(zip_path, key).is_file():
                 return True
         return False
 
