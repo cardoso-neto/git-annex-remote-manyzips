@@ -5,6 +5,8 @@ import os
 import zipfile
 import sys
 from datetime import datetime
+from functools import lru_cache
+from os.path import relpath as get_relative_path
 from pathlib import Path
 from subprocess import CompletedProcess, run
 from shlex import split
@@ -21,6 +23,19 @@ LOGFOLDER = Path("./logs/")
 
 class UnsupportedCompression(RemoteError):
     pass
+
+
+def lazy_property(wrapped: Callable) -> Callable:
+    """
+    Shortcut for the property-lru_cache double-decoration.
+
+    i.e.:
+    @property
+    @functools.lru_cache()
+    def foo(self): ...
+    https://stackoverflow.com/a/19979379/11615853
+    """
+    return property(lru_cache()(wrapped))
 
 
 def log_stuff(log_path: Path, lines: List[str]):
@@ -42,17 +57,21 @@ def _mkdir(directory: Path):
 def copyfileobj(
     fsrc: BinaryIO,
     fdst: BinaryIO,
-    length: int = 1024 * 1024,
+    length: int = 1024 * 1024,  # 2 ** 20, 1 MiB
     callback: Callable[[int], None] = lambda x: None,
+    file_size: int = None,
 ):
     """
     Copy data while passing the progress through a callback every length bytes.
 
-    shutil.copyfileobj reimplementation with: 
-    - a bigger default buffer length; 
-    - and a callback to track copying progress.
+    shutil.copyfileobj reimplementation with:
+    - a bigger default buffer length;
+    - a callback to track copying progress;
+    - a file_size argument to avoid allocating an unnecessarily big buffer.
     Copy data from file-like obj fsrc to file-like obj fdst.
     """
+    if file_size is not None:
+        length = min(length, file_size)
     # Localize variable access to minimize overhead.
     fsrc_read = fsrc.read
     fdst_write = fdst.write
@@ -63,42 +82,56 @@ def copyfileobj(
         callback(streamed_bytes)
 
 
+def delete_from_zip(zip_path: Path, file_to_delete: Path):
+    args = split(f"zip --delete {zip_path} {file_to_delete}")
+    proc: CompletedProcess = run(args, capture_output=True, text=True)
+    log_stuff(
+        zip_path.parent / LOGFOLDER / f"{zip_path.stem}.log", [proc.stdout, proc.stderr]
+    )
+    if proc.returncode != 0:
+        raise RemoteError(
+            f"Could not delete {file_to_delete!r} from {zip_path.name!r}."
+        )
+
+
 class ManyZips(SpecialRemote):
 
     def __init__(self, annex: Master):
         super().__init__(annex)
+        self.annex = annex
         self.configs = {
             "address_length": "1 for 16 .zips, 2 for 256, and 3 for 4096.",
             "directory": "Folder to store data.",
-            "compression": "Either 'store' for no compression or 'lzma' for .xz compression."
+            "compression": "'store' for no compression, 'lzma' for .xz, and 'deflate' for .zip."
+        }
+        self.compression_algos = {
+            "store": ZIP_STORED,
+            "lzma": ZIP_LZMA,
+            "deflated": ZIP_DEFLATED,
         }
 
-    @property
+    @lazy_property
     def address_length(self) -> int:
         address_length = self.annex.getconfig("address_length")
         address_length = int(address_length) if address_length != "" else 1
         if not 0 < address_length < 3:
-            raise RemoteError("address_length value should be greater than zero and smaller than 3.")
+            msg = "address_length value should be > 0 and < 3."
+            raise RemoteError(msg)
         return address_length
 
-    @property
+    @lazy_property
     def compression(self) -> int:
-        compression = self.annex.getconfig("compression")
-        if not compression:
-            self.annex.setconfig("compression", "store")
-        elif compression == "store":
-            compression = ZIP_STORED
-        elif compression == "lzma":
-            compression = ZIP_LZMA
-        elif compression == "deflated":
-            compression = ZIP_DEFLATED
-        else:
-            msg = f"Compression type {compression!r} is not available.\n"
-            msg += "Try using 'store', 'lzma', or 'deflated'."
+        _compression = self.annex.getconfig("compression")
+        if not _compression:
+            _compression = "store"
+            self.annex.setconfig("compression", _compression)
+        elif _compression not in self.compression_algos:
+            msg = f"Compression type {_compression!r} is not available.\n"
+            msg += "Use 'store', 'lzma', or 'deflated'."
             raise UnsupportedCompression(msg)
-        return compression
+        return _compression
 
-    @property
+    @lazy_property
     def directory(self) -> Path:
         directory = self.annex.getconfig("directory")
         if not directory:
@@ -132,48 +165,72 @@ class ManyZips(SpecialRemote):
         e.g.:
         filename=".git/annex/objects/qW/pV/SHA256E-s148273064--5880ac1cd05eee90db251c027771b4c9f0a55b7c8b2813c95eff59eef465ebd3.wav/SHA256E-s148273064--5880ac1cd05eee90db251c027771b4c9f0a55b7c8b2813c95eff59eef465ebd3.wav"
         """
-        if self.checkpresent(key):
+        file_path = Path(filename)
+        if self.check_file_sizes(key, file_path):
             return
         zip_path = self._get_zip_path(key)
-        with ZipFile(zip_path, 'w', compression=self.compression, allowZip64=True) as myzip:
-            zinfo = ZipInfo.from_file(
-                filename, arcname=key, strict_timestamps=myzip._strict_timestamps
-            )
-            zinfo.compress_type = myzip.compression
-            with open(filename, "rb") as src, myzip.open(zinfo, 'w') as dest:
-                copyfileobj(src, dest, callback=self.annex.progress)
-        if not self.checkpresent(key):
-            raise RemoteError("Unknown error while storing the key.")
+        zinfo = ZipInfo.from_file(
+            file_path, arcname=key, strict_timestamps=True
+        )
+        zinfo.compress_type = self.compression
+        # TODO: create inconsistent state context manager to avoid partial/corrupt
+        # transfers when user KeyboardInterrupts during a copyfileobj call
+        with ZipFile(zip_path, 'a', compression=self.compression, allowZip64=True) as myzip:
+            with open(file_path, "rb") as src, myzip.open(zinfo, 'w') as dest:
+                copyfileobj(src, dest, callback=self.annex.progress, file_size=file_path.stat().st_size)
+        if not self.check_file_sizes(key, file_path):
+            print("Unknown error while storing the key.")
+            print("Attempting to delete corrupt key from remote...")
+            delete_from_zip(zip_path, key)
+            print("Key successfully deleted.")
+            raise RemoteError("Could not store this key.")
 
     @overrides
     def transfer_retrieve(self, key: str, filename: str):
-        if not self.checkpresent(key):
-            raise RemoteError("Key not present in this remote.")
-        mount_point = self._get_mount_point(key)
-        tar_path = self._get_tar_path(key)
-
-        # TODO: copy to a tempfile then rename
-        copy2(str(mount_point / key), filename)
+        zip_path = self._get_zip_path(key)
+        with ZipFile(zip_path) as myzip:
+            zinfo = myzip.getinfo(key)
+            with myzip.open(zinfo) as myfile:
+                # TODO: copy to a tempfile then rename
+                with open(filename, 'wb') as f_out:
+                    copyfileobj(myfile, f_out, callback=self.annex.progress, file_size=zinfo.compress_size)
 
     @overrides
     def checkpresent(self, key: str) -> bool:
         zip_path = self._get_zip_path(key)
         if zip_path.is_file():
-            if ZipPath(zip_path, key).is_file():
-                return True
+            with ZipFile(zip_path) as myzip:
+                if key in myzip.namelist():
+                    zinfo = myzip.getinfo(key)
+                    # TODO: check for size mismatch
+                    # encrypted files don't have their size listed
+                    self.annex.debug(key.split("-"))
+                    self.annex.debug(zinfo.file_size)
+                    return True
+        return False
+
+    def check_file_sizes(self, key: str, file_path: Path) -> bool:
+        zip_path = self._get_zip_path(key)
+        if zip_path.is_file():
+            with ZipFile(zip_path) as myzip:
+                if key in myzip.namelist():
+                    zinfo = myzip.getinfo(key)
+                    if zinfo.file_size == file_path.stat().st_size:
+                        return True
         return False
 
     @overrides
     def remove(self, key: str):
         if not self.checkpresent(key):
-            return 
-        tar_path = self._get_tar_path(key)
-        mount_point = self._get_mount_point(key)
-        delete_from_tar(tar_path, key)  # O(n)
+            return
+        zip_path = self._get_zip_path(key)
+        delete_from_zip(zip_path, key)
         if self.checkpresent(key):
             raise RemoteError("Could not remove.")
 
     def _get_address(self, key: str) -> str:
+        # TODO: use self.annex.dirhash_lower(key).replace("/", "")[:self.address_length]
+        self.annex.dirhash_lower
         # "SHA256E-s148273064--5880ac1cd05eee9...eef465ebd3.wav"
         parts = key.split("-")
         # ["SHA256E", "s148273064", "5880ac1cd05eee9...eef465ebd3.wav"
@@ -184,10 +241,22 @@ class ManyZips(SpecialRemote):
     def _get_zip_path(self, key: str) -> Path:
         zip_path_and_stem = self.directory / self._get_address(key)
         return zip_path_and_stem.with_suffix(".zip")
- 
+
     @overrides
     def getavailability(self) -> str:
         return "local"
+
+    @overrides
+    def whereis(self, key: str) -> str:
+        """
+        Return the path of a file inside the .zip its stored.
+
+        `unzip -p path/to/archive.zip key.ext > file.ext` can be used to extract it.
+        `fuse-zip path/to/archive.zip` as well.
+        https://unix.stackexchange.com/q/14120 for more.
+        """
+        key_path = self._get_zip_path(key) / key
+        return get_relative_path(key_path)
 
 
 def main():
