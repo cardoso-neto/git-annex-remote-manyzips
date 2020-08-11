@@ -2,21 +2,30 @@
 External remote that can be easily and quickly copied.
 
 This is very similar to a directory special remote, but files are stored inside `.zip` archives (compressed or not) to allow for faster copies to other drives by minimizing random access look-ups on disks.
-<!--
+
 ## Options overview
 
-- `directory` - folder path to store the data.
-- `address_length` - defines into how many `.tar`s you want to split your files, as in `number_of_tars = 16^address_length`. TODO: `address_length=0` stores everything in a single archive.
+- `address_length` - control into how many `.zip`s your files will be split: `number_of_zips = 16^address_length`.
+- `compression` - Either `stored` for no compression, `lzma` for .7z/.xz compression, and `deflate` for the good ol' light-on-CPU .zip level 8 compression. Not recommended for use with encryption, because they data will flow through gzip before being ciphered.
+- `directory` - define in which folder data will be stored.
 
+### Cryptography-related options
+
+- `encryption` - One of "none", "hybrid", "shared", "pubkey" or "sharedpubkey". See [encryption](https://git-annex.branchable.com/encryption/).
+
+The following options are only relevant if `encryption` is not "none".
+
+- `keyid` - Choose the gpg key to use for encryption.
+- `mac` - The MAC algorithm used for the "key-hashing" the filenames. `HMACSHA256` is recommended.
+- `chunk` - This is the size in which git-annex splits the keys prior to uploading, see [chunking](https://git-annex.branchable.com/chunking).
+This is the amount of disk space that will additionally be used during upload.
+Usually useful to hide how large are your files.
+Also, if you want to access a file while it's still being downloaded using [git-annex-inprogress](https://git-annex.branchable.com/git-annex-inprogress/).
+If you use it, a value between 50MiB and 500MiB is probably a good idea.
+Smaller values mean more API calls for presence check of big files which can slow down fsck, drop or move.
+Bigger values mean more waiting time before being able to access the downloaded file via `git annex inprogress`.
+<!--
 ## Things you should be aware of
-
-### Deleting files from this remote is slow
-
-This is what I use to remove a file from an archive: [gnu.org/tar/delete](https://www.gnu.org/software/tar/manual/html_node/delete.html)
-
-From what I can gather, it's an IO-bound `O(n)` operation on the size of the whole archive.
-Can't be sure if it's a write-heavy one without some thorough testing, but I don't think that's the case.
-It definitely is read-heavy, as it has to scan the whole archive looking for the file to be deleted. 
 
 ### Making archives contiguous in disk
 
