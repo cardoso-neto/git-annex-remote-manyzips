@@ -150,13 +150,9 @@ class ManyZips(SpecialRemote):
 
     @overrides
     def prepare(self):
-        self.info = {
-            "address_length": self.address_length,
-            "compression": self.compression,
-            "directory": self.directory,
-        }
         if not self.directory.is_dir():
             raise RemoteError(f"{str(self.directory)!r} not found.")
+        self.compression_algorithm = self.compression_algos[self.compression]
 
     @overrides
     def transfer_store(self, key: str, filename: str):
@@ -172,10 +168,10 @@ class ManyZips(SpecialRemote):
         zinfo = ZipInfo.from_file(
             file_path, arcname=key, strict_timestamps=True
         )
-        zinfo.compress_type = self.compression
+        zinfo.compress_type = self.compression_algorithm
         # TODO: create inconsistent state context manager to avoid partial/corrupt
         # transfers when user KeyboardInterrupts during a copyfileobj call
-        with ZipFile(zip_path, 'a', compression=self.compression, allowZip64=True) as myzip:
+        with ZipFile(zip_path, 'a', compression=self.compression_algorithm, allowZip64=True) as myzip:
             with open(file_path, "rb") as src, myzip.open(zinfo, 'w') as dest:
                 copyfileobj(src, dest, callback=self.annex.progress, file_size=file_path.stat().st_size)
         if not self.check_file_sizes(key, file_path):
@@ -183,7 +179,8 @@ class ManyZips(SpecialRemote):
             print("Attempting to delete corrupt key from remote...")
             delete_from_zip(zip_path, key)
             print("Key successfully deleted.")
-            raise RemoteError("Could not store this key.")
+            msg = "Could not store this key. drop it --from this-remote and retry."
+            raise RemoteError(msg)
 
     @overrides
     def transfer_retrieve(self, key: str, filename: str):
@@ -204,8 +201,8 @@ class ManyZips(SpecialRemote):
                     zinfo = myzip.getinfo(key)
                     # TODO: check for size mismatch
                     # encrypted files don't have their size listed
-                    self.annex.debug(key.split("-"))
-                    self.annex.debug(zinfo.file_size)
+                    # self.annex.debug(f'key: "{key.split("-")}"')
+                    # self.annex.debug(f"zipped: '{zinfo.file_size}'")
                     return True
         return False
 
