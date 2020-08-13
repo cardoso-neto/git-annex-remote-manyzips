@@ -2,3 +2,5 @@ annexremote
 black
 overrides
 pylint
+setuptools
+wheel
