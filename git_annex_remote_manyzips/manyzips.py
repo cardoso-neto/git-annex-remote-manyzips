@@ -1,15 +1,14 @@
 #!/usr/bin/env python
 
-import inspect
-import os
-import zipfile
 import sys
 from datetime import datetime
 from functools import lru_cache
+from inspect import stack
 from os.path import relpath as get_relative_path
 from pathlib import Path
 from subprocess import CompletedProcess, run
 from shlex import split
+from shutil import move
 from typing import BinaryIO, Callable, List, Optional
 from zipfile import ZIP_DEFLATED, ZIP_LZMA, ZIP_STORED
 from zipfile import Path as ZipPath, ZipFile, ZipInfo
@@ -42,8 +41,8 @@ def log_stuff(log_path: Path, lines: List[str]):
     log_path.parent.mkdir(exist_ok=True)
     with open(log_path, "a") as stdout_file:
         stdout_file.write(f"{datetime.now()}\n")
-        stdout_file.write(f"{inspect.stack()[2].function}->")
-        stdout_file.write(f"{inspect.stack()[1].function}\n")
+        stdout_file.write(f"{stack()[2].function}->")
+        stdout_file.write(f"{stack()[1].function}\n")
         stdout_file.write("\n".join(lines))
 
 
@@ -51,7 +50,7 @@ def _mkdir(directory: Path):
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        raise RemoteError(f"Failed to write to {str(directory)!r}")
+        raise RemoteError(f"Failed to write to {str(directory)!r}; {e!r}.")
 
 
 def copyfileobj(
@@ -171,6 +170,7 @@ class ManyZips(SpecialRemote):
         zinfo.compress_type = self.compression_algorithm
         # TODO: create inconsistent state context manager to avoid partial/corrupt
         # transfers when user KeyboardInterrupts during a copyfileobj call
+        # a lockfile perhaps?
         with ZipFile(zip_path, 'a', compression=self.compression_algorithm, allowZip64=True) as myzip:
             with open(file_path, "rb") as src, myzip.open(zinfo, 'w') as dest:
                 copyfileobj(src, dest, callback=self.annex.progress, file_size=file_path.stat().st_size)
@@ -178,19 +178,21 @@ class ManyZips(SpecialRemote):
             print("Unknown error while storing the key.")
             print("Attempting to delete corrupt key from remote...")
             delete_from_zip(zip_path, key)
-            print("Key successfully deleted.")
+            print("Corrupted key was successfully deleted.")
             msg = "Could not store this key. drop it --from this-remote and retry."
             raise RemoteError(msg)
 
     @overrides
     def transfer_retrieve(self, key: str, filename: str):
+        file_path = Path(filename)
         zip_path = self._get_zip_path(key)
         with ZipFile(zip_path) as myzip:
             zinfo = myzip.getinfo(key)
             with myzip.open(zinfo) as myfile:
-                # TODO: copy to a tempfile then rename
-                with open(filename, 'wb') as f_out:
+                tempfile_path = file_path.parent / f"{file_path.name}.temp"
+                with open(tempfile_path, 'wb') as f_out:
                     copyfileobj(myfile, f_out, callback=self.annex.progress, file_size=zinfo.compress_size)
+                move(tempfile_path, file_path)
 
     @overrides
     def checkpresent(self, key: str) -> bool:
@@ -201,8 +203,15 @@ class ManyZips(SpecialRemote):
                     zinfo = myzip.getinfo(key)
                     # TODO: check for size mismatch
                     # encrypted files don't have their size listed
-                    # self.annex.debug(f'key: "{key.split("-")}"')
-                    # self.annex.debug(f"zipped: '{zinfo.file_size}'")
+                    # self.annex.debug(f'"{key.split("-")}"')
+                    # self.annex.debug(f"zipped: '{zinfo.file_size}' '{zinfo.compress_size}")
+                    key_size_field = self._get_size_from_key(key)
+                    if key_size_field is not None:
+                        if key_size_field != zinfo.file_size:
+                            delete_from_zip(zip_path, key)
+                            return False
+                    # an encrypted key that was not completely copied would still be marked as ok...
+                    # TODO: save the size of an encrypted key while storing it
                     return True
         return False
 
@@ -227,10 +236,9 @@ class ManyZips(SpecialRemote):
 
     def _get_address(self, key: str) -> str:
         # TODO: use self.annex.dirhash_lower(key).replace("/", "")[:self.address_length]
-        self.annex.dirhash_lower
         # "SHA256E-s148273064--5880ac1cd05eee9...eef465ebd3.wav"
-        parts = key.split("-")
-        # ["SHA256E", "s148273064", "5880ac1cd05eee9...eef465ebd3.wav"
+        parts = key.split("--")
+        # ["SHA256E-s148273064", "5880ac1cd05eee9...eef465ebd3.wav"]
         address = parts[-1][:self.address_length]
         # "588"
         return address
@@ -238,6 +246,20 @@ class ManyZips(SpecialRemote):
     def _get_zip_path(self, key: str) -> Path:
         zip_path_and_stem = self.directory / self._get_address(key)
         return zip_path_and_stem.with_suffix(".zip")
+
+    @staticmethod
+    def _get_size_from_key(key: str) -> Optional[int]:
+        # TODO: use run(f"git-annex examinekey {key} --format='${bytesize}\n'")
+        metadata, _ = key.split("--")
+        # "GPGHMACSHA1", "d0a3fc75bb721eb4ffbf84f13ffc4e4583c25c76"
+        # "SHA256E-s148273064", "5880ac1cd05eee9...eef465ebd3.wav"
+        parts = metadata.split("-s")
+        # ["GPGHMACSHA1"]
+        if len(parts) > 1:
+            # ["SHA256E", "148273064"]
+            key_size = int(parts[1])
+            return key_size
+        return None
 
     @overrides
     def getavailability(self) -> str:
