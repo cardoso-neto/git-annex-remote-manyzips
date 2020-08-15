@@ -5,20 +5,6 @@ This is very similar to a directory special remote, but files are stored inside 
 Useful for repos with several thousand small files.
 Especially useful if they're text files, because then you could use compression.
 
-## Install
-
-### `pip` (recommended)
-
-```
-git clone https://github.com/cardoso-neto/git-annex-remote-manyzips.git
-cd git-annex-remote-manyzips
-pip install -e ./
-```
-
-### Manual
-
-Clone this repo and symlink/hardlink/copy [git_annex_remote_manyzips/manyzips](git_annex_remote_manyzips/manyzips) to somewhere in `$PATH`.
-
 ## Options overview
 
 - `address_length` - control into how many `.zip`s your files will be split: `number_of_zips = 16^address_length`. e.g.: `address_length=2`
@@ -36,18 +22,39 @@ The following options are only relevant if `encryption` is not "none".
 - `keyid` - Choose the gpg key to use for encryption. e.g.: `keyid=2512E3C7` or `keyid=name@email.com`
 - `mac` - The MAC algorithm used for the "key-hashing" the filenames. `HMACSHA256` is recommended.
 
+## Install
 
-## Tips
+You need [git](https://git-scm.com/book/en/v2/Getting-Started-Installing-Git) and [git-annex](https://git-annex.branchable.com/install/) already installed.
 
-### Making archives contiguous in disk
+You also need `python>=3.8` and `pip`.
+I personally recommend [miniconda](https://conda.io/miniconda.html) to install those.
+It's like [nvm](https://github.com/nvm-sh/nvm), but for python.
 
-The ext4 filesystem already does a splendid job of that, so this is probably unnecessary, but you can always make sure of it by running `e4defrag` on your `directory`.
+### `pip` (recommended)
 
-### `.zip` file counts
+```
+git clone https://github.com/cardoso-neto/git-annex-remote-manyzips.git
+cd git-annex-remote-manyzips
+pip install -e ./
+```
 
-You don't want to let your `.zip`s get too big.
-I'm pretty confident there is no operation that's `O(n)` on the size of the archives, but checking a `.zip`'s index is definitely `O(n)` on the number of files (`O(n/number_of_buckets)`) inside it.
-That's what `address_length` is for.
+### Manual
+
+Clone this repo and symlink/hardlink/copy [git_annex_remote_manyzips/manyzips](git_annex_remote_manyzips/manyzips) to somewhere in `$PATH`.
+
+## Usage
+
+```
+git init
+git annex init
+git annex add $yourfiles
+
+git annex initremote $remotename \
+  type=external externaltype=manyzips encryption=none \
+  address_length=2 compression=lzma directory=/mnt/drive/zipsannex
+
+git annex copy --to $remotename
+``` 
 
 ## Options (detailed)
 
@@ -79,3 +86,15 @@ No problems will arise, but to avoid data loss you should not ever remove files 
 Default is `HMACSHA1` and the strongest is `HMACSHA512`, which could end up resulting in too large a file-name.
 Hence, `HMACSHA256` is the recommended one.
 See [MAC algorithm](https://git-annex.branchable.com/encryption/#index5h2).
+
+## Tips
+
+### Making archives contiguous in disk
+
+The ext4 filesystem already does a splendid job of that, so this is probably unnecessary, but you can always make sure of it by running `e4defrag` on your `directory`.
+
+### `.zip` file counts
+
+You don't want to let your `.zip`s get too big.
+I'm pretty confident there is no operation that's `O(n)` on the size of the archives, but checking a `.zip`'s index is definitely `O(n)` on the number of files (`O(n/number_of_buckets)`) inside it.
+That's what `address_length` is for.
