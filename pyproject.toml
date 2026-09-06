@@ -45,7 +45,7 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = ""
-source-include = [".python-version", "test.sh", "tests/**", "uv.lock"]
+source-include = [".python-version", "test.sh", "tests/**"]
 
 [tool.black]
 target-version = ["py314"]

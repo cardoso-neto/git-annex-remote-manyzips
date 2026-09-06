@@ -85,10 +85,10 @@ See [MAC algorithm](https://git-annex.branchable.com/encryption/#index5h2).
 
 ## Testing
 
-Sync the locked development environment and run the complete suite:
+Sync the development environment and run the complete suite:
 
 ```sh
-uv sync --frozen
+uv sync
 ./test.sh
 ```
 

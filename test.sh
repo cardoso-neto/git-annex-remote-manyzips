@@ -8,4 +8,4 @@ for command in git git-annex; do
     fi
 done
 
-uv run --frozen python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
