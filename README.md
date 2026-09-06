@@ -94,6 +94,12 @@ uv sync
 
 The suite requires `git` and `git-annex`. Every test creates a real repository and exercises the installed remote through `git-annex`; there are no mocked protocol or ZIP-operation tests. It covers configuration failures, every compression mode, round trips, integrity checks, removal, damaged archives, and concurrent transfers.
 
+## Data safety and failure behavior
+
+**Presence checks are strictly read-only.** Missing, incomplete, or damaged content is reported as absent without changing the archive. Only an explicit store or removal request modifies remote data, so merely checking or running a fast `fsck` cannot delete potentially recoverable content.
+
+Retrieval writes to a temporary file before replacing its destination, and deletion rebuilds a temporary archive before atomically replacing the original. Stores append directly to the selected ZIP for speed. The remote cleans up after ordinary failures and graceful interruption such as Ctrl-C, but an uncatchable termination (`SIGKILL`), kernel crash, power loss, or device removal during a store can damage that ZIP. After such an event, run `git annex fsck --from REMOTE`; as with any backup, retain another verified copy of important content.
+
 ## Tips
 
 ### Making archives contiguous in disk

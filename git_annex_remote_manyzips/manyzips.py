@@ -15,9 +15,12 @@ from zipfile import ZIP_DEFLATED, ZIP_LZMA, ZIP_STORED, BadZipFile, ZipFile, Zip
 
 from annexremote import Master, RemoteError, SpecialRemote
 
-
-class UnsupportedCompression(RemoteError):
-    """Raised when a configured ZIP compression method is unknown."""
+COMPRESSION_ALGORITHMS = {
+    "store": ZIP_STORED,
+    "lzma": ZIP_LZMA,
+    "deflate": ZIP_DEFLATED,
+}
+COMPRESSION_ALIASES = {"stored": "store", "deflated": "deflate"}
 
 
 def _mkdir(directory: Path):
@@ -128,13 +131,6 @@ class ManyZips(SpecialRemote):
             "directory": "Folder to store data.",
             "compression": "'store' for none, 'lzma' for LZMA, or 'deflate' for DEFLATE.",
         }
-        self.compression_algos = {
-            "store": ZIP_STORED,
-            "lzma": ZIP_LZMA,
-            "deflate": ZIP_DEFLATED,
-        }
-        self.compression_aliases = {"stored": "store", "deflated": "deflate"}
-        self.compression_algorithm = ZIP_STORED
 
     @cached_property
     def address_length(self) -> int:
@@ -157,11 +153,11 @@ class ManyZips(SpecialRemote):
         if not configured:
             configured = "store"
             self.annex.setconfig("compression", configured)
-        compression = self.compression_aliases.get(configured, configured)
-        if compression not in self.compression_algos:
+        compression = COMPRESSION_ALIASES.get(configured, configured)
+        if compression not in COMPRESSION_ALGORITHMS:
             msg = f"Compression type {configured!r} is not available.\n"
             msg += "Use 'store', 'lzma', or 'deflate'."
-            raise UnsupportedCompression(msg)
+            raise RemoteError(msg)
         if compression != configured:
             self.annex.setconfig("compression", compression)
         return compression
@@ -185,10 +181,9 @@ class ManyZips(SpecialRemote):
         _mkdir(self.directory)
 
     def prepare(self):
-        """Verify availability and select the configured ZIP compression."""
+        """Verify that the storage directory is available."""
         if not self.directory.is_dir():
             raise RemoteError(f"{str(self.directory)!r} not found.")
-        self.compression_algorithm = self.compression_algos[self.compression]
 
     def transfer_store(self, key: str, local_file: str):
         """Store a local git-annex object under its key."""
@@ -196,6 +191,7 @@ class ManyZips(SpecialRemote):
         zip_path = self._get_zip_path(key)
         try:
             file_size = file_path.stat().st_size
+            compression_algorithm = COMPRESSION_ALGORITHMS[self.compression]
             with archive_lock(zip_path, exclusive=True):
                 if self._member_exists_unlocked(key):
                     delete_from_zip(zip_path, key)
@@ -203,12 +199,12 @@ class ManyZips(SpecialRemote):
                 zinfo = ZipInfo.from_file(
                     file_path, arcname=key, strict_timestamps=False
                 )
-                zinfo.compress_type = self.compression_algorithm
+                zinfo.compress_type = compression_algorithm
                 try:
                     with ZipFile(
                         zip_path,
                         "a",
-                        compression=self.compression_algorithm,
+                        compression=compression_algorithm,
                         allowZip64=True,
                     ) as myzip:
                         with (
@@ -281,21 +277,10 @@ class ManyZips(SpecialRemote):
         if not zip_path.is_file():
             return False
         try:
-            with archive_lock(zip_path, exclusive=True):
+            with archive_lock(zip_path, exclusive=False):
                 return self._checkpresent_unlocked(key)
         except (BadZipFile, OSError, RuntimeError) as error:
             raise RemoteError(f"Could not check {key!r}: {error}.") from error
-
-    def check_file_sizes(self, key: str, file_path: Path) -> bool:
-        """Return whether an archived member has the same size as a local file."""
-        zip_path = self._get_zip_path(key)
-        if not zip_path.is_file():
-            return False
-        try:
-            with archive_lock(zip_path, exclusive=False):
-                return self._check_file_sizes_unlocked(key, file_path)
-        except (BadZipFile, OSError) as error:
-            raise RemoteError(f"Could not inspect {key!r}: {error}.") from error
 
     def remove(self, key: str):
         """Remove a key while retaining all other members in its archive."""
@@ -304,7 +289,7 @@ class ManyZips(SpecialRemote):
             return
         try:
             with archive_lock(zip_path, exclusive=True):
-                if not self._checkpresent_unlocked(key):
+                if not self._member_exists_unlocked(key):
                     return
                 delete_from_zip(zip_path, key)
                 if self._member_exists_unlocked(key):
@@ -344,10 +329,7 @@ class ManyZips(SpecialRemote):
             except KeyError:
                 return False
         key_size = self._get_size_from_key(key)
-        if key_size is not None and key_size != zinfo.file_size:
-            delete_from_zip(zip_path, key)
-            return False
-        return True
+        return key_size is None or key_size == zinfo.file_size
 
     def _get_address(self, key: str) -> str:
         # "SHA256E-s148273064--5880ac1cd05eee9...eef465ebd3.wav"

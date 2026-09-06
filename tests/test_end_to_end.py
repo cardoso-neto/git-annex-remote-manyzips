@@ -328,6 +328,22 @@ class GitAnnexEndToEndTests(unittest.TestCase):
             "archive",
             expected=(1,),
         )
+        with ZipFile(archive_path) as archive:
+            self.assertIn(damaged_key, archive.namelist())
+            self.assertIn(healthy_key, archive.namelist())
+            self.assertIsNone(archive.testzip())
+
+        self.run_command(
+            "git",
+            "annex",
+            "drop",
+            "--quiet",
+            "--force",
+            "--from",
+            "archive",
+            "--",
+            damaged_name,
+        )
         self.run_command("git", "annex", "checkpresentkey", healthy_key, "archive")
         with ZipFile(archive_path) as archive:
             self.assertNotIn(damaged_key, archive.namelist())
