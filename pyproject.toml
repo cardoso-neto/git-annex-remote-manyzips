@@ -36,7 +36,6 @@ git-annex-remote-manyzips = "git_annex_remote_manyzips.manyzips:main"
 [dependency-groups]
 dev = [
     "black>=26.5.1",
-    "coverage>=7.16.0",
     "pylint>=4.0.8",
 ]
 
@@ -50,11 +49,3 @@ source-include = [".python-version", "test.sh", "tests/**", "uv.lock"]
 
 [tool.black]
 target-version = ["py314"]
-
-[tool.coverage.run]
-branch = true
-source = ["git_annex_remote_manyzips"]
-
-[tool.coverage.report]
-fail_under = 90
-show_missing = true

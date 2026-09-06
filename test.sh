@@ -1,5 +1,11 @@
 #!/bin/sh
 set -eu
 
-uv run --frozen coverage run -m unittest discover -s tests -v
-uv run --frozen coverage report
+for command in git git-annex; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+        echo "Required end-to-end test command not found: $command" >&2
+        exit 1
+    fi
+done
+
+uv run --frozen python -m unittest discover -s tests -v

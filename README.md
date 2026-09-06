@@ -92,7 +92,7 @@ uv sync --frozen
 ./test.sh
 ```
 
-The suite uses Python's standard `unittest` runner under Python 3.14 and enforces at least 90% coverage. Unit tests cover configuration, all compression modes, archive integrity, failures, cleanup, and protocol startup. Integration tests run real `git-annex` round trips and concurrent transfers when `git-annex` is available; otherwise those tests are skipped.
+The suite requires `git` and `git-annex`. Every test creates a real repository and exercises the installed remote through `git-annex`; there are no mocked protocol or ZIP-operation tests. It covers configuration failures, every compression mode, round trips, integrity checks, removal, damaged archives, and concurrent transfers.
 
 ## Tips
 
