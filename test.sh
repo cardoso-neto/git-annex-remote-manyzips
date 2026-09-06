@@ -8,4 +8,6 @@ for command in git git-annex; do
     fi
 done
 
+uv run ruff format --check .
+uv run ruff check .
 uv run python -m unittest discover -s tests -v

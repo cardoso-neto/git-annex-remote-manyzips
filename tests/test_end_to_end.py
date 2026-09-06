@@ -1,14 +1,13 @@
 """End-to-end tests that exercise the remote through real git-annex commands."""
 
-# pylint: disable=missing-class-docstring,missing-function-docstring
-# pylint: disable=consider-using-with
-
 import hashlib
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZIP_LZMA, ZIP_STORED, ZipFile
@@ -364,6 +363,125 @@ class GitAnnexEndToEndTests(unittest.TestCase):
         output = result.stdout + result.stderr
         self.assertIn("Could not check", output)
         self.assertNotIn("Traceback", output)
+
+    def test_store_request_repairs_same_size_corruption(self):
+        files = {"repair/same-size.bin": b"content that must survive intact\n" * 100}
+        self.annex_files(files)
+        name, original = next(iter(files.items()))
+        key = self.key_for(name)
+        directory = self.remote_directory()
+        self.init_remote(directory=directory, address_length="1")
+        self.run_command("git", "annex", "copy", "--to", "archive", "--", name)
+
+        archive_path = self.archive_for(directory, key, 1)
+        replacement = b"x" * len(original)
+        self.replace_member(archive_path, key, replacement)
+        with ZipFile(archive_path) as archive:
+            self.assertEqual(archive.read(key), replacement)
+
+        self.run_command(
+            "git",
+            "annex",
+            "transferkey",
+            key,
+            "--to=archive",
+            f"--file={name}",
+        )
+        with ZipFile(archive_path) as archive:
+            self.assertEqual(archive.read(key), original)
+            self.assertEqual(archive.namelist().count(key), 1)
+        self.run_command("git", "annex", "fsck", "--from", "archive", "--", name)
+
+    def test_interrupted_store_leaves_archive_usable(self):
+        large_payload = os.urandom(32 * 1024 * 1024)
+        prefix = hashlib.sha256(large_payload).hexdigest()[0]
+        neighbor_payload = self.colliding_payloads(prefix, 1)[0]
+        files = {
+            "interrupt/existing.txt": neighbor_payload,
+            "interrupt/large.bin": large_payload,
+        }
+        self.annex_files(files)
+        keys = {name: self.key_for(name) for name in files}
+        directory = self.remote_directory()
+        self.init_remote(directory=directory, address_length="1", compression="deflate")
+        self.run_command(
+            "git",
+            "annex",
+            "copy",
+            "--to",
+            "archive",
+            "--",
+            "interrupt/existing.txt",
+        )
+
+        archive_path = directory / f"{prefix}.zip"
+        original_size = archive_path.stat().st_size
+        command = (
+            "git",
+            "annex",
+            "transferkey",
+            keys["interrupt/large.bin"],
+            "--to=archive",
+            "--file=interrupt/large.bin",
+        )
+        process = subprocess.Popen(
+            command,
+            cwd=self.repo,
+            env=self.environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while archive_path.stat().st_size < original_size + 1024 * 1024:
+                if process.poll() is not None:
+                    stdout, stderr = process.communicate()
+                    self.fail(
+                        "Store completed before it could be interrupted"
+                        f"\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    )
+                if time.monotonic() >= deadline:
+                    self.fail("Timed out waiting for the store to write archive data")
+                time.sleep(0.01)
+            os.killpg(process.pid, signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=90)
+            cleanup_deadline = time.monotonic() + 90
+            while True:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    break
+                if time.monotonic() >= cleanup_deadline:
+                    self.fail("Interrupted remote did not finish cleaning up")
+                time.sleep(0.01)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+
+        self.assertNotEqual(
+            process.returncode,
+            0,
+            f"Interrupted store unexpectedly succeeded\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        )
+        with ZipFile(archive_path) as archive:
+            self.assertEqual(
+                archive.read(keys["interrupt/existing.txt"]), neighbor_payload
+            )
+            self.assertNotIn(keys["interrupt/large.bin"], archive.namelist())
+            self.assertIsNone(archive.testzip())
+
+        self.run_command(
+            "git",
+            "annex",
+            "transferkey",
+            keys["interrupt/large.bin"],
+            "--to=archive",
+            "--file=interrupt/large.bin",
+        )
+        self.run_command("git", "annex", "fsck", "--from", "archive", "--", *files)
 
 
 if __name__ == "__main__":

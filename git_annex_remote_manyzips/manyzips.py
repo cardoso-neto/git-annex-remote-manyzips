@@ -2,6 +2,7 @@
 """Store git-annex keys in a configurable set of ZIP archives."""
 
 import sys
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from fcntl import LOCK_EX, LOCK_SH, flock
 from functools import cached_property
@@ -9,8 +10,8 @@ from hashlib import sha256
 from os.path import relpath as get_relative_path
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import BinaryIO, Callable, Iterator, Optional
-from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_LZMA, ZIP_STORED, ZipFile, ZipInfo
+from typing import BinaryIO
+from zipfile import ZIP_DEFLATED, ZIP_LZMA, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
 
 from annexremote import Master, RemoteError, SpecialRemote
 
@@ -53,7 +54,7 @@ def copyfileobj(
     fdst: BinaryIO,
     length: int = 1024 * 1024,  # 2 ** 20, 1 MiB
     callback: Callable[[int], None] = lambda x: None,
-    file_size: Optional[int] = None,
+    file_size: int | None = None,
 ):
     """
     Copy data while passing the progress through a callback every length bytes.
@@ -196,8 +197,6 @@ class ManyZips(SpecialRemote):
         try:
             file_size = file_path.stat().st_size
             with archive_lock(zip_path, exclusive=True):
-                if self._check_file_sizes_unlocked(key, file_path):
-                    return
                 if self._member_exists_unlocked(key):
                     delete_from_zip(zip_path, key)
 
@@ -369,7 +368,7 @@ class ManyZips(SpecialRemote):
         return zip_path_and_stem.with_suffix(".zip")
 
     @staticmethod
-    def _get_size_from_key(key: str) -> Optional[int]:
+    def _get_size_from_key(key: str) -> int | None:
         metadata = key.split("--", 1)[0]
         # "GPGHMACSHA1", "d0a3fc75bb721eb4ffbf84f13ffc4e4583c25c76"
         # "SHA256E-s148273064", "5880ac1cd05eee9...eef465ebd3.wav"

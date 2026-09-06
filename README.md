@@ -103,5 +103,6 @@ The ext4 filesystem already does a splendid job of that, so this is probably unn
 ### `.zip` file counts
 
 You don't want to let your `.zip`s get too big.
-I'm pretty confident there is no operation that's `O(n)` on the size of the archives, but checking a `.zip`'s index is definitely `O(n)` on the number of files (`O(n/number_of_buckets)`) inside it.
-That's what `address_length` is for.
+Normal operations inspect the selected archive's central directory, so their metadata work grows with the number of keys in that bucket. Apart from the key being transferred, they do not read or rewrite other members' payloads.
+
+Deletion is the exception. ZIP has no portable constant-time deletion that both removes a member from ordinary ZIP tools and reclaims its space. This remote atomically rebuilds the selected archive, reading and recompressing its remaining members. Deletion time and temporary disk use therefore grow with that archive's total contents. Deletions are expected to be rare; `address_length` limits their cost by distributing keys among more archives.

@@ -35,8 +35,7 @@ git-annex-remote-manyzips = "git_annex_remote_manyzips.manyzips:main"
 
 [dependency-groups]
 dev = [
-    "black>=26.5.1",
-    "pylint>=4.0.8",
+    "ruff>=0.13.0",
 ]
 
 [build-system]
@@ -47,5 +46,8 @@ build-backend = "uv_build"
 module-root = ""
 source-include = [".python-version", "test.sh", "tests/**"]
 
-[tool.black]
-target-version = ["py314"]
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "I", "UP", "RUF"]
