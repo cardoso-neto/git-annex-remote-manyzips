@@ -8,7 +8,7 @@ Especially useful if they're text files, because then you could use compression.
 ## Options overview
 
 - `address_length` - control into how many `.zip`s your files will be split: `number_of_zips = 16^address_length`. e.g.: `address_length=2`
-- `compression` - Either `stored` for no compression, `lzma` for `.7z`/`.xz` compression, and `deflate` for the good ol' light-on-CPU `.zip` level 8 compression.
+- `compression` - `store` for no compression, `lzma` for stronger compression, or `deflate` for faster compression. The default is `store`.
 - `directory` - define in which folder data will be stored. e.g.: `directory=~/zipsannex/`
 
 ### Cryptography-related options
@@ -26,21 +26,15 @@ The following options are only relevant if `encryption` is not "none".
 
 You need [git](https://git-scm.com/book/en/v2/Getting-Started-Installing-Git) and [git-annex](https://git-annex.branchable.com/install/) already installed.
 
-You also need `python>=3.8` and `pip`.
-I personally recommend [miniconda](https://conda.io/miniconda.html) to install those.
-It's like [nvm](https://github.com/nvm-sh/nvm), but for python.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/). The project requires Python 3.14; uv downloads and manages it automatically when needed.
 
-### `pip` (recommended)
+### Install the remote
 
-```
+```sh
 git clone https://github.com/cardoso-neto/git-annex-remote-manyzips.git
 cd git-annex-remote-manyzips
-pip install -e ./
+uv tool install .
 ```
-
-### Manual
-
-Clone this repo and symlink/hardlink/copy [git_annex_remote_manyzips/manyzips](git_annex_remote_manyzips/manyzips) to somewhere in `$PATH`.
 
 ## Usage
 
@@ -60,12 +54,14 @@ git annex copy --to $remotename
 
 #### `address_length`
 
-This parameter ontrols how many characters of the beginning of a file's hex hash digest will be used for the `.zip` file path.
+This parameter controls how many characters of the beginning of a file's hex hash digest will be used for the `.zip` file path.
 e.g.: if `address_length = 3` and `SHA256E-s50621986--ddd1a997afaf60c981fbfb1a1f3a600ff7bad7fccece9f2508fb695b8c2f153d` as the file to be stored, the `.zip` path will be `ddd.zip` and all files stored here would go into one of 4096 buckets.
 
 #### `compression`
 
 Not recommended for use with encryption, because the data already flows through gzip before being ciphered.
+
+`stored` and `deflated`, accepted by older documentation/code, remain supported as aliases for `store` and `deflate`.
 
 #### `chunk`
 
@@ -86,6 +82,15 @@ No problems will arise, but to avoid data loss you should not ever remove files 
 Default is `HMACSHA1` and the strongest is `HMACSHA512`, which could end up resulting in too large a file-name.
 Hence, `HMACSHA256` is the recommended one.
 See [MAC algorithm](https://git-annex.branchable.com/encryption/#index5h2).
+
+## Testing
+
+Sync the development environment and run the complete suite:
+
+```sh
+uv sync
+./test.sh
+```
 
 ## Tips
 
