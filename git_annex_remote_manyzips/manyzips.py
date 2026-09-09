@@ -4,12 +4,14 @@
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from fcntl import LOCK_EX, LOCK_SH, flock
+from copy import copy
+from fcntl import LOCK_EX, flock
 from functools import cached_property
 from hashlib import sha256
 from os.path import relpath as get_relative_path
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from time import sleep
 from typing import BinaryIO
 from zipfile import ZIP_DEFLATED, ZIP_LZMA, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
 
@@ -33,8 +35,8 @@ def _mkdir(directory: Path):
 
 
 @contextmanager
-def archive_lock(zip_path: Path, exclusive: bool) -> Iterator[None]:
-    """Lock one archive across concurrently running remote processes."""
+def archive_lock(zip_path: Path) -> Iterator[None]:
+    """Allow only one writer per archive. Readers do not take this lock."""
     lock_directory = zip_path.parent / ".locks"
     _mkdir(lock_directory)
     lock_path = lock_directory / f"{zip_path.name}.lock"
@@ -46,10 +48,50 @@ def archive_lock(zip_path: Path, exclusive: bool) -> Iterator[None]:
         ) from error
     with lock_file:
         try:
-            flock(lock_file, LOCK_EX if exclusive else LOCK_SH)
+            flock(lock_file, LOCK_EX)
         except OSError as error:
             raise RemoteError(f"Could not lock {zip_path.name!r}: {error}.") from error
         yield
+
+
+@contextmanager
+def recoverable_append(zip_path: Path):
+    """Save the ZIP index in memory and restore it if an append fails.
+
+    The caller must hold the writer lock. This cannot recover from process
+    death or a device that also refuses the recovery writes.
+    """
+    existed = zip_path.exists()
+    with open(zip_path, "r+b" if existed else "w+b", buffering=0) as raw:
+        offset, tail = 0, b""
+        if existed:
+            with ZipFile(raw) as archive:
+                # zipfile uses this offset when appending. It is an internal
+                # attribute, so the end-to-end recovery tests must cover it.
+                offset = archive.start_dir
+            raw.seek(offset)
+            tail = raw.read()
+        try:
+            yield raw
+        except BaseException as error:
+            try:
+                # Release space used by the failed append before restoring.
+                raw.truncate(offset + len(tail))
+                raw.seek(offset)
+                remaining = memoryview(tail)
+                while remaining:
+                    written = raw.write(remaining)
+                    if not written:
+                        raise OSError("Could not restore the ZIP index")
+                    remaining = remaining[written:]
+                if not existed:
+                    zip_path.unlink()
+            except OSError as recovery_error:
+                raise RemoteError(
+                    f"Store failed: {error}. ZIP index recovery also failed: "
+                    f"{recovery_error}. Restore {zip_path} from another copy."
+                ) from error
+            raise
 
 
 def copyfileobj(
@@ -102,7 +144,7 @@ def delete_from_zip(zip_path: Path, file_to_delete: str):
                         continue
                     with (
                         source.open(info) as member,
-                        destination.open(info, "w") as output,
+                        destination.open(copy(info), "w") as output,
                     ):
                         copyfileobj(member, output, file_size=info.file_size)
         temporary_path.chmod(archive_mode)
@@ -127,7 +169,7 @@ class ManyZips(SpecialRemote):
         super().__init__(annex)
         self.annex = annex
         self.configs = {
-            "address_length": "1 for 16 .zips, 2 for 256, and 3 for 4096.",
+            "address_length": "1 to 3 prefix characters; hex keys use up to 16, 256, or 4096 ZIPs.",
             "directory": "Folder to store data.",
             "compression": "'store' for none, 'lzma' for LZMA, or 'deflate' for DEFLATE.",
         }
@@ -149,17 +191,12 @@ class ManyZips(SpecialRemote):
     @cached_property
     def compression(self) -> str:
         """Return the configured compression name in canonical form."""
-        configured = self.annex.getconfig("compression")
-        if not configured:
-            configured = "store"
-            self.annex.setconfig("compression", configured)
+        configured = self.annex.getconfig("compression") or "store"
         compression = COMPRESSION_ALIASES.get(configured, configured)
         if compression not in COMPRESSION_ALGORITHMS:
             msg = f"Compression type {configured!r} is not available.\n"
             msg += "Use 'store', 'lzma', or 'deflate'."
             raise RemoteError(msg)
-        if compression != configured:
-            self.annex.setconfig("compression", compression)
         return compression
 
     @cached_property
@@ -179,6 +216,7 @@ class ManyZips(SpecialRemote):
             "directory": self.directory,
         }
         _mkdir(self.directory)
+        self.annex.setconfig("compression", self.compression)
 
     def prepare(self):
         """Verify that the storage directory is available."""
@@ -192,17 +230,17 @@ class ManyZips(SpecialRemote):
         try:
             file_size = file_path.stat().st_size
             compression_algorithm = COMPRESSION_ALGORITHMS[self.compression]
-            with archive_lock(zip_path, exclusive=True):
-                if self._member_exists_unlocked(key):
+            with archive_lock(zip_path):
+                if self._member_info(key) is not None:
                     delete_from_zip(zip_path, key)
 
                 zinfo = ZipInfo.from_file(
                     file_path, arcname=key, strict_timestamps=False
                 )
                 zinfo.compress_type = compression_algorithm
-                try:
+                with recoverable_append(zip_path) as raw:
                     with ZipFile(
-                        zip_path,
+                        raw,
                         "a",
                         compression=compression_algorithm,
                         allowZip64=True,
@@ -217,20 +255,11 @@ class ManyZips(SpecialRemote):
                                 callback=self.annex.progress,
                                 file_size=file_size,
                             )
-                except BaseException as transfer_error:
-                    try:
-                        if self._member_exists_unlocked(key):
-                            delete_from_zip(zip_path, key)
-                    except RemoteError as cleanup_error:
+                    info = self._member_info(key)
+                    if info is None or info.file_size != file_size:
                         raise RemoteError(
-                            f"The transfer failed and its partial key could not be removed: "
-                            f"{cleanup_error}"
-                        ) from transfer_error
-                    raise
-                if not self._check_file_sizes_unlocked(key, file_path):
-                    if self._member_exists_unlocked(key):
-                        delete_from_zip(zip_path, key)
-                    raise RemoteError("The stored key did not match the source size.")
+                            "The stored key did not match the source size."
+                        )
         except (BadZipFile, OSError, RuntimeError, ValueError) as error:
             raise RemoteError(f"Could not store {key!r}: {error}.") from error
 
@@ -240,30 +269,31 @@ class ManyZips(SpecialRemote):
         zip_path = self._get_zip_path(key)
         tempfile_path = None
         try:
-            with archive_lock(zip_path, exclusive=False):
-                with ZipFile(zip_path) as myzip:
-                    zinfo = myzip.getinfo(key)
-                    with (
-                        myzip.open(zinfo) as myfile,
-                        NamedTemporaryFile(
-                            mode="wb",
-                            dir=file_path.parent,
-                            prefix=f".{file_path.name}.",
-                            suffix=".manyzips-temp",
-                            delete=False,
-                        ) as f_out,
-                    ):
-                        tempfile_path = Path(f_out.name)
-                        copyfileobj(
-                            myfile,
-                            f_out,
-                            callback=self.annex.progress,
-                            file_size=zinfo.file_size,
-                        )
-                tempfile_path.replace(file_path)
-                tempfile_path = None
+            with ZipFile(zip_path) as myzip:
+                zinfo = myzip.getinfo(key)
+                with (
+                    myzip.open(zinfo) as myfile,
+                    NamedTemporaryFile(
+                        mode="wb",
+                        dir=file_path.parent,
+                        prefix=f".{file_path.name}.",
+                        suffix=".manyzips-temp",
+                        delete=False,
+                    ) as f_out,
+                ):
+                    tempfile_path = Path(f_out.name)
+                    copyfileobj(
+                        myfile,
+                        f_out,
+                        callback=self.annex.progress,
+                        file_size=zinfo.file_size,
+                    )
+            tempfile_path.replace(file_path)
+            tempfile_path = None
         except (BadZipFile, KeyError, OSError, RuntimeError) as error:
-            raise RemoteError(f"Could not retrieve {key!r}: {error}.") from error
+            raise RemoteError(
+                f"Could not retrieve {key!r}: {error}. If a store is active, retry after it finishes."
+            ) from error
         finally:
             if tempfile_path is not None:
                 try:
@@ -273,14 +303,14 @@ class ManyZips(SpecialRemote):
 
     def checkpresent(self, key: str) -> bool:
         """Return whether a complete key is present in its archive."""
-        zip_path = self._get_zip_path(key)
-        if not zip_path.is_file():
-            return False
         try:
-            with archive_lock(zip_path, exclusive=False):
-                return self._checkpresent_unlocked(key)
+            info = self._member_info(key)
+            size = self._get_size_from_key(key)
+            return info is not None and (size is None or size == info.file_size)
         except (BadZipFile, OSError, RuntimeError) as error:
-            raise RemoteError(f"Could not check {key!r}: {error}.") from error
+            raise RemoteError(
+                f"Could not check {key!r}: {error}. If a store is active, retry after it finishes."
+            ) from error
 
     def remove(self, key: str):
         """Remove a key while retaining all other members in its archive."""
@@ -288,48 +318,29 @@ class ManyZips(SpecialRemote):
         if not zip_path.is_file():
             return
         try:
-            with archive_lock(zip_path, exclusive=True):
-                if not self._member_exists_unlocked(key):
+            with archive_lock(zip_path):
+                if self._member_info(key) is None:
                     return
                 delete_from_zip(zip_path, key)
-                if self._member_exists_unlocked(key):
+                if self._member_info(key) is not None:
                     raise RemoteError(f"Could not remove {key!r}.")
         except (BadZipFile, OSError, RuntimeError) as error:
             raise RemoteError(f"Could not remove {key!r}: {error}.") from error
 
-    def _member_exists_unlocked(self, key: str) -> bool:
+    def _member_info(self, key: str) -> ZipInfo | None:
+        """Read a member's metadata. Callers that write must hold the lock."""
         zip_path = self._get_zip_path(key)
-        if not zip_path.is_file():
-            return False
-        with ZipFile(zip_path) as myzip:
+        for attempt in range(4):
             try:
-                myzip.getinfo(key)
-            except KeyError:
-                return False
-            return True
-
-    def _check_file_sizes_unlocked(self, key: str, file_path: Path) -> bool:
-        zip_path = self._get_zip_path(key)
-        if not zip_path.is_file():
-            return False
-        with ZipFile(zip_path) as myzip:
-            try:
-                zinfo = myzip.getinfo(key)
-            except KeyError:
-                return False
-            return zinfo.file_size == file_path.stat().st_size
-
-    def _checkpresent_unlocked(self, key: str) -> bool:
-        zip_path = self._get_zip_path(key)
-        if not zip_path.is_file():
-            return False
-        with ZipFile(zip_path) as myzip:
-            try:
-                zinfo = myzip.getinfo(key)
-            except KeyError:
-                return False
-        key_size = self._get_size_from_key(key)
-        return key_size is None or key_size == zinfo.file_size
+                with ZipFile(zip_path) as myzip:
+                    return myzip.getinfo(key)
+            except FileNotFoundError, KeyError:
+                return None
+            except BadZipFile:
+                if attempt == 3:
+                    raise
+                # A concurrent append briefly replaces the ZIP index.
+                sleep(0.05)
 
     def _get_address(self, key: str) -> str:
         # "SHA256E-s148273064--5880ac1cd05eee9...eef465ebd3.wav"

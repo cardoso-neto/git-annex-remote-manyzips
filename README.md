@@ -7,7 +7,7 @@ Especially useful if they're text files, because then you could use compression.
 
 ## Options overview
 
-- `address_length` - control into how many `.zip`s your files will be split: `number_of_zips = 16^address_length`. Valid values are 1, 2, and 3. e.g.: `address_length=2`
+- `address_length` - use 1, 2, or 3 prefix characters to select a ZIP. For hexadecimal keys, this gives up to `16^address_length` ZIPs. e.g.: `address_length=2`
 - `compression` - `store` for no compression, `lzma` for stronger compression, or `deflate` for faster compression. The default is `store`.
 - `directory` - define in which folder data will be stored. e.g.: `directory=~/zipsannex/`
 
@@ -57,6 +57,8 @@ git annex copy --to $remotename
 This parameter controls how many characters of the beginning of a file's hex hash digest will be used for the `.zip` file path.
 e.g.: if `address_length = 3` and `SHA256E-s50621986--ddd1a997afaf60c981fbfb1a1f3a600ff7bad7fccece9f2508fb695b8c2f153d` as the file to be stored, the `.zip` path will be `ddd.zip` and all files stored here would go into one of 4096 buckets.
 
+These counts apply to hexadecimal keys, such as SHA256E. Other key types can use letters, digits, `_`, and `-`. They can produce more ZIPs and an uneven distribution. The remote hashes a prefix that contains unsupported characters. The address rule stays the same so existing archives remain accessible.
+
 #### `compression`
 
 Not recommended for use with encryption, because the data already flows through gzip before being ciphered.
@@ -92,13 +94,17 @@ uv sync
 ./test.sh
 ```
 
-The suite requires `git` and `git-annex`. Every test creates a real repository and exercises the installed remote through `git-annex`; there are no mocked protocol or ZIP-operation tests. It covers configuration failures, every compression mode, round trips, integrity checks, removal, damaged archives, and concurrent transfers.
+The suite requires `git` and `git-annex`. It runs Ruff and tests real repositories through `git-annex`. Tests include compression, damaged content, parallel transfers, reads during an active store, read-only storage, and failed writes. The write-failure test uses an OS file-size limit to cause a real I/O error. It does not fill the host disk.
 
 ## Data safety and failure behavior
 
-**Presence checks are strictly read-only.** Missing, incomplete, or damaged content is reported as absent without changing the archive. Only an explicit store or removal request modifies remote data, so merely checking or running a fast `fsck` cannot delete potentially recoverable content.
+**Presence checks never change stored content.** A missing member or a known size mismatch is reported as absent. An unreadable ZIP is reported as an error. Checks do not detect corruption that leaves the size unchanged; use a full `git annex fsck --from REMOTE` to check content.
 
-Retrieval writes to a temporary file before replacing its destination, and deletion rebuilds a temporary archive before atomically replacing the original. Stores append directly to the selected ZIP for speed. The remote cleans up after ordinary failures and graceful interruption such as Ctrl-C, but an uncatchable termination (`SIGKILL`), kernel crash, power loss, or device removal during a store can damage that ZIP. After such an event, run `git annex fsck --from REMOTE`; as with any backup, retain another verified copy of important content.
+Reads need no locks or write access to the archive directory. Writers still take a lock to prevent two writers from changing the same ZIP at once. During a store, a read of any member in that ZIP can fail because the ZIP index is incomplete. Presence checks retry an invalid index three times, with a 50 ms delay each time. If the index is still unreadable, the remote returns an error. Retrieval errors also ask the caller to retry after the store ends. Parallel uploads can need a retry too, because git-annex checks for content before it starts each upload.
+
+Retrieval writes to a temporary file before replacing its destination. Deletion writes a temporary archive before replacing the original. A store appends to the selected ZIP for speed. Before it appends, the remote saves the old ZIP index in memory. If the append fails, it removes the new bytes and restores the index. This preserves the other members without copying their content. When replacing a key, the old member is removed first; a failed replacement can leave that key absent.
+
+Recovery needs a working disk and a running process. If recovery writes also fail, the remote reports that failure. `SIGKILL`, a kernel crash, power loss, or device removal can still damage the ZIP. There is no power-loss durability guarantee. After a crash, keep a copy of the affected ZIP before repair and run `git annex fsck --from REMOTE`. A check can find damage; it cannot guarantee repair. Keep another verified copy of important content.
 
 ## Tips
 
@@ -109,6 +115,6 @@ The ext4 filesystem already does a splendid job of that, so this is probably unn
 ### `.zip` file counts
 
 You don't want to let your `.zip`s get too big.
-Normal operations inspect the selected archive's central directory, so their metadata work grows with the number of keys in that bucket. Apart from the key being transferred, they do not read or rewrite other members' payloads.
+New stores and reads inspect the selected archive's index. That metadata work grows with the number of keys in the bucket. Apart from the key being transferred, they do not read or rewrite other members' content. The index saved for write recovery also uses memory in proportion to its size.
 
-Deletion is the exception. ZIP has no portable constant-time deletion that both removes a member from ordinary ZIP tools and reclaims its space. This remote atomically rebuilds the selected archive, reading and recompressing its remaining members. Deletion time and temporary disk use therefore grow with that archive's total contents. Deletions are expected to be rare; `address_length` limits their cost by distributing keys among more archives.
+Deletion and replacement of an existing key rebuild the selected archive. The remote reads and recompresses the remaining members. This takes time and temporary disk space in proportion to the archive's contents. Deletions are expected to be rare. A larger `address_length` spreads keys among more archives and can reduce this cost. ZIP has no portable constant-time deletion that also recovers the deleted member's space.

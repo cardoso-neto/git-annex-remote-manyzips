@@ -461,7 +461,35 @@ class GitAnnexEndToEndTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     self.fail("Timed out waiting for the store to write archive data")
                 time.sleep(0.01)
+            # Stop a real writer after it has overwritten the old ZIP index.
+            # This holds the race open without changing the remote's code.
+            os.killpg(process.pid, signal.SIGSTOP)
+            result = self.run_command(
+                "git",
+                "annex",
+                "checkpresentkey",
+                keys["interrupt/existing.txt"],
+                "archive",
+                expected=(100,),
+            )
+            self.assertIn("retry after it finishes", result.stderr + result.stdout)
+            self.run_command(
+                "git", "annex", "drop", "--force", "--", "interrupt/existing.txt"
+            )
+            result = self.run_command(
+                "git",
+                "annex",
+                "transferkey",
+                keys["interrupt/existing.txt"],
+                "--from=archive",
+                expected=(1,),
+            )
+            self.assertIn("Could not retrieve", result.stderr + result.stdout)
+            self.assertNotIn("Traceback", result.stderr + result.stdout)
+            self.assertFalse((self.repo / "interrupt/existing.txt").exists())
+            self.assertEqual(list(self.repo.rglob("*.manyzips-temp")), [])
             os.killpg(process.pid, signal.SIGINT)
+            os.killpg(process.pid, signal.SIGCONT)
             stdout, stderr = process.communicate(timeout=90)
             cleanup_deadline = time.monotonic() + 90
             while True:
@@ -473,9 +501,11 @@ class GitAnnexEndToEndTests(unittest.TestCase):
                     self.fail("Interrupted remote did not finish cleaning up")
                 time.sleep(0.01)
         finally:
-            if process.poll() is None:
+            try:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.communicate()
+            except ProcessLookupError:
+                pass
+            process.communicate()
 
         self.assertNotEqual(
             process.returncode,
@@ -493,11 +523,106 @@ class GitAnnexEndToEndTests(unittest.TestCase):
             "git",
             "annex",
             "transferkey",
+            keys["interrupt/existing.txt"],
+            "--from=archive",
+        )
+        self.assertEqual(
+            (self.repo / "interrupt/existing.txt").read_bytes(), neighbor_payload
+        )
+
+        self.run_command(
+            "git",
+            "annex",
+            "transferkey",
             keys["interrupt/large.bin"],
             "--to=archive",
             "--file=interrupt/large.bin",
         )
         self.run_command("git", "annex", "fsck", "--from", "archive", "--", *files)
+
+    def test_failed_write_restores_existing_archive(self):
+        payload = os.urandom(4 * 1024 * 1024)
+        prefix = hashlib.sha256(payload).hexdigest()[0]
+        files = {
+            "existing.txt": self.colliding_payloads(prefix, 1)[0],
+            "too-large.bin": payload,
+        }
+        self.annex_files(files)
+        self.init_remote(address_length="1", compression="store")
+        self.run_command("git", "annex", "copy", "--to=archive", "--", "existing.txt")
+        archive_path = self.remote_directory() / f"{prefix}.zip"
+        with ZipFile(archive_path, "a") as archive:
+            archive.comment = b"Keep the complete ZIP index, including this comment."
+        before = archive_path.read_bytes()
+        self.init_remote("empty", address_length="1", compression="store")
+
+        # An OS file-size limit causes a real EFBIG write failure in the
+        # remote process. SIGXFSZ is ignored so Python receives the I/O error.
+        launcher = self.bin_directory / "git-annex-remote-manyzips"
+        original_launcher = launcher.read_text()
+        launcher.write_text(
+            f"#!{sys.executable}\n"
+            "import resource, signal\n"
+            "signal.signal(signal.SIGXFSZ, signal.SIG_IGN)\n"
+            "resource.setrlimit(resource.RLIMIT_FSIZE, (1048576, 1048576))\n"
+            "from git_annex_remote_manyzips.manyzips import main\n"
+            "main()\n"
+        )
+        key = self.key_for("too-large.bin")
+        try:
+            result = self.run_command(
+                "git",
+                "annex",
+                "transferkey",
+                key,
+                "--to=archive",
+                expected=(1,),
+            )
+            empty_result = self.run_command(
+                "git", "annex", "transferkey", key, "--to=empty", expected=(1,)
+            )
+        finally:
+            launcher.write_text(original_launcher)
+        self.assertIn("File too large", result.stderr + result.stdout)
+        self.assertIn("File too large", empty_result.stderr + empty_result.stdout)
+        self.assertEqual(list(self.remote_directory("empty").glob("*.zip")), [])
+        self.assertNotIn("Traceback", result.stderr + result.stdout)
+        self.assertEqual(archive_path.read_bytes(), before)
+        self.run_command("git", "annex", "fsck", "--from=archive", "--", "existing.txt")
+        self.run_command("git", "annex", "transferkey", key, "--to=archive")
+        self.run_command("git", "annex", "fsck", "--from=archive", "--", *files)
+
+    def test_read_only_archive_needs_no_lock_directory(self):
+        files = {"read-only.txt": b"content from a read-only backup\n"}
+        self.annex_files(files)
+        self.init_remote(address_length="1")
+        self.run_command("git", "annex", "copy", "--to=archive")
+        self.run_command("git", "annex", "drop", "--force", ".")
+        directory = self.remote_directory()
+        shutil.rmtree(directory / ".locks")
+        archives = list(directory.glob("*.zip"))
+        before = {path.name: path.read_bytes() for path in archives}
+        for path in archives:
+            path.chmod(0o444)
+        directory.chmod(0o555)
+        try:
+            self.run_command(
+                "git",
+                "annex",
+                "checkpresentkey",
+                self.key_for("read-only.txt"),
+                "archive",
+            )
+            self.run_command("git", "annex", "copy", "--from=archive")
+            self.assert_file_contents(files)
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in archives}, before
+            )
+            self.assertFalse((directory / ".locks").exists())
+        finally:
+            directory.chmod(0o755)
+            for path in archives:
+                path.chmod(0o644)
 
 
 if __name__ == "__main__":
